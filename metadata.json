@@ -1,0 +1,6 @@
+{
+  "name": "ALMANSOOR SMART FINANCE ERP",
+  "description": "المنصور للأنظمة المالية والإدارية الذكية - نظام ERP مؤسسي متكامل للمحاسبة المزدوجة وإدارة المبيعات والمشتريات والمخازن والعملاء والمناطق",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
