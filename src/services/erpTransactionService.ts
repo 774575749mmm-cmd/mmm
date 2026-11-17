@@ -2913,7 +2913,7 @@ export function updateApprovalRuleTransaction(
   ruleId: string,
   patch: Partial<ApprovalWorkflowRule>
 ): TransactionResult<ApprovalWorkflowRule> {
-  if (!user.canManageSettings && user.role !== 'المدير المالي' && user.role !== 'مدير النظام' && user.role !== 'مالك المؤسسة') {
+  if (!user.canManageSettings && user.role !== 'المدير المالي' && user.role !== 'مدير النظام' && user.role !== 'مالك المؤسسة' && user.role !== 'Tenant Admin') {
     return { ok: false, error: 'عذراً، لا تملك صلاحية تعديل قواعد الاعتماد.' };
   }
   const targetRule = (db.approvalRules || []).find((r) => r.id === ruleId);
@@ -2955,7 +2955,7 @@ export function toggleFiscalPeriodTransaction(
   user: User,
   periodId: string
 ): TransactionResult<FiscalPeriod> {
-  if (!user.canManageSettings && user.role !== 'المدير المالي' && user.role !== 'مدير النظام' && user.role !== 'مالك المؤسسة') {
+  if (!user.canManageSettings && user.role !== 'المدير المالي' && user.role !== 'مدير النظام' && user.role !== 'مالك المؤسسة' && user.role !== 'Tenant Admin') {
     return { ok: false, error: 'فقط المدير المالي أو مدير النظام يمكنه فتح/إغلاق الفترات المالية.' };
   }
   const period = (db.fiscalPeriods || []).find((fp) => fp.id === periodId);
@@ -2994,8 +2994,16 @@ export function updateUserPermissionsTransaction(
   if (!actor.active) {
     return { ok: false, error: 'هذا الحساب موقوف إدارياً ولا يملك صلاحية التنفيذ.' };
   }
-  if (!actor.canManageSettings && actor.role !== 'مدير النظام' && actor.role !== 'مالك المؤسسة') {
+  if (
+    !actor.canManageSettings &&
+    actor.role !== 'مدير النظام' &&
+    actor.role !== 'مالك المؤسسة' &&
+    actor.role !== 'Tenant Admin'
+  ) {
     return { ok: false, error: 'عذراً، لا تملك صلاحية تعديل صلاحيات المستخدمين.' };
+  }
+  if (updatedUser.isSuperAdmin && !actor.isSuperAdmin) {
+    return { ok: false, error: 'صلاحية مرفوضة: مدير المنشأة لا يملك صلاحية منح صفة Super Admin.' };
   }
   const activeCompanyId = db.activeCompanyId || db.company.id;
   const tenantCheck = assertTenantAccess(actor, activeCompanyId);
@@ -3056,8 +3064,16 @@ export function addUserTransaction(
   if (!actor.active) {
     return { ok: false, error: 'هذا الحساب موقوف إدارياً ولا يملك صلاحية التنفيذ.' };
   }
-  if (!actor.canManageSettings && actor.role !== 'مدير النظام' && actor.role !== 'مالك المؤسسة') {
+  if (
+    !actor.canManageSettings &&
+    actor.role !== 'مدير النظام' &&
+    actor.role !== 'مالك المؤسسة' &&
+    actor.role !== 'Tenant Admin'
+  ) {
     return { ok: false, error: 'عذراً، لا تملك صلاحية إضافة مستخدمين.' };
+  }
+  if (newUser.isSuperAdmin && !actor.isSuperAdmin) {
+    return { ok: false, error: 'صلاحية مرفوضة: مدير المنشأة لا يملك صلاحية إنشاء حساب Super Admin.' };
   }
   const activeCompanyId = db.activeCompanyId || db.company.id;
   const tenantCheck = assertTenantAccess(actor, activeCompanyId);

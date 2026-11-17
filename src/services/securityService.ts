@@ -18,6 +18,9 @@ const DEFAULT_ROLE_PERMISSION_PRESETS: Record<UserRoleType, Record<string, Parti
   'مدير النظام': {
     '*': { view: true, create: true, edit: true, delete: true, post: true, approve: true, export: true, print: true, manageSettings: true, viewCosts: true },
   },
+  'Tenant Admin': {
+    '*': { view: true, create: true, edit: true, delete: true, post: true, approve: true, export: true, print: true, manageSettings: true, viewCosts: true },
+  },
   'المدير المالي': {
     '*': { view: true, create: true, edit: true, delete: false, post: true, approve: true, export: true, print: true, manageSettings: false, viewCosts: true },
     accounting: { view: true, create: true, edit: true, delete: false, post: true, approve: true, export: true, print: true },
@@ -231,13 +234,48 @@ export function buildUserRoleMatrix(role: UserRoleType): GranularPermissionMatri
   return JSON.parse(JSON.stringify(DEFAULT_ROLE_PERMISSION_PRESETS[role] || DEFAULT_ROLE_PERMISSION_PRESETS['مستخدم محدود']));
 }
 
+export function isPlatformSuperAdmin(
+  user: { isSuperAdmin?: boolean; role?: string } | null | undefined
+): boolean {
+  return Boolean(
+    user &&
+      (user.isSuperAdmin === true ||
+        (user.role === 'مالك المؤسسة' && user.isSuperAdmin !== false))
+  );
+}
+
+export function isTenantAdminUser(
+  user: { role?: string; canManageSettings?: boolean } | null | undefined
+): boolean {
+  if (!user) return false;
+  return (
+    user.role === 'Tenant Admin' ||
+    user.role === 'مالك المؤسسة' ||
+    user.role === 'مدير النظام' ||
+    Boolean(user.canManageSettings)
+  );
+}
+
+export function getRoleDisplayLabel(role: string, lang: 'ar' | 'en' = 'ar'): string {
+  if (role === 'Tenant Admin') {
+    return lang === 'en' ? 'Tenant Admin' : 'مدير المنشأة (Tenant Admin)';
+  }
+  return role;
+}
+
 export function hasGranularPermission(
   user: User | null | undefined,
   moduleKey: string,
   action: PermissionAction
 ): boolean {
   if (!user || !user.active) return false;
-  if (user.role === 'مالك المؤسسة' || user.role === 'مدير النظام') return true;
+  if (
+    user.role === 'مالك المؤسسة' ||
+    user.role === 'مدير النظام' ||
+    user.role === 'Tenant Admin'
+  ) {
+    return true;
+  }
 
   // Check explicit user permissionMatrix first
   const matrix = user.permissionMatrix;

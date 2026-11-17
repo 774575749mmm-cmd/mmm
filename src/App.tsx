@@ -45,7 +45,12 @@ import {
 import { getEffectiveCurrencyRate } from './services/currencyHelpers';
 import { setActivePrintTemplates } from './services/exportService';
 import { AppLanguage, getTabLabel, syncDocumentLanguage, t } from './services/i18n';
-import { assertTenantAccess } from './services/securityService';
+import { assertTenantAccess, isPlatformSuperAdmin } from './services/securityService';
+import {
+  cloudApiService,
+  hydrateErpDatabaseFromServerState,
+  serverUserToErpUser,
+} from './services/cloudApiService';
 import {
   TransactionResult,
   TransactionOptions,
@@ -204,6 +209,9 @@ export default function App() {
 
   const initialDbRef = useRef<ERPDatabase | null>(null);
   const hasUserMutatedRef = useRef(false);
+  const cloudRevisionRef = useRef<number>(1);
+  const skipNextCloudSaveRef = useRef<boolean>(true);
+  const cloudSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   if (!initialDbRef.current) initialDbRef.current = db;
   useEffect(() => {
     if (db !== initialDbRef.current) {
@@ -226,9 +234,9 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState<User>(() => db.users[0]);
 
   const authorizedCompanies = useMemo(() => {
-    const all = db.companies && db.companies.length > 0 ? db.companies : [db.company];
+    const all = db.companies && db.companies.length > 0 ? db.companies : [];
     return all.filter((c) => assertTenantAccess(currentUser, c.id).ok);
-  }, [db.companies, db.company, currentUser]);
+  }, [db.companies, currentUser]);
 
   // Keep currentBranch synced to the active company's branches cleanly
   useEffect(() => {
@@ -239,6 +247,7 @@ export default function App() {
 
   // Real Session & Authentication Gate State
   const [isAuthenticated, setIsAuthenticated] = useState(false);
+  const [cloudSessionActive, setCloudSessionActive] = useState(false);
   const [authModalMode, setAuthModalMode] = useState<'bootstrap' | 'login' | 'force_change_password' | null>('login');
   const [pendingPasswordChangeUser, setPendingPasswordChangeUser] = useState<User | null>(null);
   const [authCanCancel, setAuthCanCancel] = useState(false);
@@ -407,80 +416,108 @@ export default function App() {
     }, 4500);
   }, []);
 
-  // Hydrate from IndexedDB & verify authenticated server session
+  const hydrateWorkspaceFromCloud = useCallback(
+    async (localSeed?: ERPDatabase) => {
+      const snapshot = await cloudApiService.getCompanyState();
+      const hydrated = hydrateErpDatabaseFromServerState(snapshot, localSeed);
+      let effectiveRevision = snapshot.revision || 0;
+
+      if (effectiveRevision === 0) {
+        const seedRes = await cloudApiService.saveCompanyState(hydrated, snapshot.companyId, 0);
+        if (seedRes.ok) {
+          effectiveRevision = seedRes.revision;
+        }
+      }
+
+      const finalDb: ERPDatabase = {
+        ...hydrated,
+        revision: Math.max(1, effectiveRevision),
+      };
+      cloudRevisionRef.current = Math.max(1, effectiveRevision);
+      skipNextCloudSaveRef.current = true;
+      initialDbRef.current = finalDb;
+      setDb(finalDb);
+      if (finalDb.branches[0]) setCurrentBranch(finalDb.branches[0]);
+      const baseCurr =
+        finalDb.currencies.find((c) => c.code === finalDb.company.baseCurrency) ||
+        finalDb.currencies.find((c) => c.isBase) ||
+        finalDb.currencies[0];
+      if (baseCurr) setCurrentCurrency(baseCurr);
+      return { hydratedDb: finalDb, snapshot };
+    },
+    []
+  );
+
+  // Hydrate from PostgreSQL authoritative session + IndexedDB cache
   useEffect(() => {
     let active = true;
     const syncAuthAndIdb = async () => {
       const idbData = await loadDatabaseFromIDB();
       if (!active) return;
 
-      let effectiveDb = db;
-      if (idbData && !hasUserMutatedRef.current) {
-        initialDbRef.current = idbData;
-        effectiveDb = idbData;
-        setDb(idbData);
-        if (idbData.branches[0]) setCurrentBranch(idbData.branches[0]);
-        if (idbData.currencies[0]) setCurrentCurrency(idbData.currencies[0]);
-      }
+      const effectiveDb = idbData || db;
 
       try {
-        const res = await fetch('/api/auth/status', { credentials: 'include' });
-        const data = (await res.json().catch(() => ({}))) as {
-          initialized?: boolean;
-          authenticated?: boolean;
-          user?: { id: string; mustChangePassword?: boolean };
-        };
+        const data = await cloudApiService.getAuthStatus();
         if (!active) return;
 
-        const hasLocalHashes = effectiveDb.users.some((u) => Boolean(u.passwordHash && u.passwordSalt));
-        if (!data.initialized && !hasLocalHashes) {
+        if (!data.initialized) {
+          if (idbData && !hasUserMutatedRef.current) {
+            initialDbRef.current = idbData;
+            setDb(idbData);
+            if (idbData.branches[0]) setCurrentBranch(idbData.branches[0]);
+            if (idbData.currencies[0]) setCurrentCurrency(idbData.currencies[0]);
+          }
           setIsAuthenticated(false);
+          setCloudSessionActive(false);
           setAuthCanCancel(false);
           setAuthModalMode('bootstrap');
           return;
         }
 
         if (data.authenticated && data.user?.id) {
-          const matched = effectiveDb.users.find((u) => u.id === data.user?.id && u.active);
-          if (matched) {
+          try {
+            const { hydratedDb } = await hydrateWorkspaceFromCloud(effectiveDb);
+            if (!active) return;
+
+            const serverUser = serverUserToErpUser(data.user);
+            const matched =
+              hydratedDb.users.find((u) => u.id === serverUser.id && u.active) || serverUser;
+
             if (matched.mustChangePassword || data.user.mustChangePassword) {
               setPendingPasswordChangeUser(matched);
               setIsAuthenticated(false);
+              setCloudSessionActive(true);
               setAuthCanCancel(false);
               setAuthModalMode('force_change_password');
               return;
             }
-            const activeCid = effectiveDb.activeCompanyId || effectiveDb.company.id;
-            if (!assertTenantAccess(matched, activeCid).ok) {
-              const allCompanies =
-                effectiveDb.companies && effectiveDb.companies.length > 0
-                  ? effectiveDb.companies
-                  : [effectiveDb.company];
-              const fallbackCompany = allCompanies.find((c) => assertTenantAccess(matched, c.id).ok);
-              if (!fallbackCompany) {
-                setIsAuthenticated(false);
-                setAuthCanCancel(false);
-                setAuthModalMode('login');
-                return;
-              }
-              const switched = switchActiveCompanyInDb(effectiveDb, fallbackCompany.id);
-              setDb(switched);
-              const nextBr = switched.branches.find((b) => b.companyId === fallbackCompany.id);
-              if (nextBr) setCurrentBranch(nextBr);
-            }
+
             setCurrentUser(matched);
+            setCloudSessionActive(true);
             setIsAuthenticated(true);
             setAuthModalMode(null);
             return;
+          } catch {
+            if (!active) return;
           }
         }
 
+        // Unauthenticated: do NOT leak previous company workspace
+        setCloudSessionActive(false);
         setIsAuthenticated(false);
         setAuthCanCancel(false);
         setAuthModalMode('login');
       } catch {
         if (!active) return;
+        if (idbData && !hasUserMutatedRef.current) {
+          initialDbRef.current = idbData;
+          setDb(idbData);
+          if (idbData.branches[0]) setCurrentBranch(idbData.branches[0]);
+          if (idbData.currencies[0]) setCurrentCurrency(idbData.currencies[0]);
+        }
         const hasLocalHashes = effectiveDb.users.some((u) => Boolean(u.passwordHash && u.passwordSalt));
+        setCloudSessionActive(false);
         setIsAuthenticated(false);
         setAuthCanCancel(false);
         setAuthModalMode(hasLocalHashes ? 'login' : 'bootstrap');
@@ -491,15 +528,40 @@ export default function App() {
     return () => {
       active = false;
     };
-  }, []);
+  }, [hydrateWorkspaceFromCloud]);
 
   const handleLogout = useCallback(async () => {
-    await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' }).catch(() => null);
+    if (cloudSaveTimerRef.current) {
+      clearTimeout(cloudSaveTimerRef.current);
+      cloudSaveTimerRef.current = null;
+      if (cloudSessionActive && isAuthenticated) {
+        const activeCid = db.activeCompanyId || db.company.id;
+        await cloudApiService
+          .saveCompanyState(db, activeCid, cloudRevisionRef.current)
+          .catch(() => null);
+      }
+    }
+    await cloudApiService.logout();
+    if (cloudSessionActive) {
+      skipNextCloudSaveRef.current = true;
+      setDb((prev) => ({
+        ...prev,
+        companies: [],
+        users: [],
+        customers: [],
+        vendors: [],
+        invoices: [],
+        journalEntries: [],
+        paymentVouchers: [],
+      }));
+    }
+    setFloatingWindows([]);
     setIsAuthenticated(false);
-    setAuthCanCancel(false);
+    setCloudSessionActive(false);
     setPendingPasswordChangeUser(null);
+    setAuthCanCancel(false);
     setAuthModalMode('login');
-  }, []);
+  }, [cloudSessionActive, isAuthenticated, db]);
 
   // Sync state across concurrent tabs/windows in the same browser via BroadcastChannel
   useEffect(() => {
@@ -514,10 +576,38 @@ export default function App() {
     return unsubscribe;
   }, []);
 
-  // Persist DB automatically (debounced to keep typing/table updates smooth)
+  // Persist DB locally (IndexedDB cache) + sync authoritatively to PostgreSQL when cloud-authenticated
   useEffect(() => {
     saveDatabaseDebounced(db, 350);
-  }, [db]);
+
+    if (!cloudSessionActive || !isAuthenticated) return;
+    if (skipNextCloudSaveRef.current) {
+      skipNextCloudSaveRef.current = false;
+      return;
+    }
+
+    if (cloudSaveTimerRef.current) {
+      clearTimeout(cloudSaveTimerRef.current);
+    }
+
+    const activeCid = db.activeCompanyId || db.company.id;
+    cloudSaveTimerRef.current = setTimeout(async () => {
+      cloudSaveTimerRef.current = null;
+      const res = await cloudApiService.saveCompanyState(db, activeCid, cloudRevisionRef.current);
+      if (res.ok) {
+        cloudRevisionRef.current = res.revision;
+      } else if (res.conflict) {
+        await hydrateWorkspaceFromCloud().catch(() => null);
+        notify('info', 'تم تحديث البيانات من جلسة أحدث على الخادم.');
+      }
+    }, 450);
+
+    return () => {
+      if (cloudSaveTimerRef.current) {
+        clearTimeout(cloudSaveTimerRef.current);
+      }
+    };
+  }, [db, cloudSessionActive, isAuthenticated, hydrateWorkspaceFromCloud, notify]);
 
   // Flush any pending DB save cleanly on page close / reload
   useEffect(() => {
@@ -828,12 +918,35 @@ export default function App() {
   };
 
   const handleSwitchCompany = useCallback(
-    (targetCompanyId: string) => {
+    async (targetCompanyId: string) => {
+      if (!isPlatformSuperAdmin(currentUser)) {
+        notify('error', 'عذراً، التنقل بين المنشآت متاح لمالك المنصة (Super Admin) فقط.');
+        return;
+      }
       const accessCheck = assertTenantAccess(currentUser, targetCompanyId);
       if (!accessCheck.ok) {
         notify('error', accessCheck.error || 'عذراً، لا تملك صلاحية الوصول إلى هذه المنشأة.');
         return;
       }
+
+      if (cloudSessionActive) {
+        try {
+          if (cloudSaveTimerRef.current) {
+            clearTimeout(cloudSaveTimerRef.current);
+            cloudSaveTimerRef.current = null;
+            const curCid = db.activeCompanyId || db.company.id;
+            await cloudApiService.saveCompanyState(db, curCid, cloudRevisionRef.current);
+          }
+          const switched = await cloudApiService.switchCompany(targetCompanyId);
+          const { hydratedDb } = await hydrateWorkspaceFromCloud();
+          notify('info', `تم التبديل إلى منشأة: ${switched.company?.nameAr || hydratedDb.company.nameAr}`);
+          return;
+        } catch (err: unknown) {
+          notify('error', err instanceof Error ? err.message : 'فشل التبديل إلى المنشأة المطلوبة.');
+          return;
+        }
+      }
+
       const nextDb = switchActiveCompanyInDb(db, targetCompanyId);
       setDb(nextDb);
       const nextBranch =
@@ -846,7 +959,7 @@ export default function App() {
       if (baseCurr) setCurrentCurrency(baseCurr);
       notify('info', `تم التبديل إلى منشأة: ${nextDb.company.nameAr}`);
     },
-    [db, currentUser, notify]
+    [db, currentUser, cloudSessionActive, hydrateWorkspaceFromCloud, notify]
   );
 
   const executeResetDatabase = () => {
@@ -1555,13 +1668,32 @@ export default function App() {
             currentUser={currentUser}
             lang={lang}
             onChangeLanguage={handleChangeLanguage}
-            onUpdateCompany={(c) =>
+            onUpdateCompany={(c) => {
               setDb((prev) => ({
                 ...prev,
                 company: c,
                 companies: (prev.companies || [prev.company]).map((x) => (x.id === c.id ? c : x)),
-              }))
-            }
+              }));
+              if (cloudSessionActive) {
+                void cloudApiService
+                  .updateCompany(c.id, {
+                    nameAr: c.nameAr,
+                    nameEn: c.nameEn,
+                    countryCode: c.countryCode,
+                    baseCurrency: c.baseCurrency,
+                    valuationPolicy: c.valuationPolicy,
+                    commercialRecord: c.commercialRecord,
+                    taxNumber: c.taxNumber,
+                    phone: c.phone,
+                    email: c.email,
+                    address: c.address,
+                    fiscalYearStart: c.fiscalYearStart,
+                  })
+                  .catch((err) => {
+                    notify('error', err instanceof Error ? err.message : 'تعذر مزامنة تحديث المنشأة مع PostgreSQL.');
+                  });
+              }
+            }}
             onUpdateSettings={(s) => setDb((prev) => ({ ...prev, settings: s }))}
             onSavePrintTemplates={handleSavePrintTemplates}
             onSaveBranch={(b: Branch) =>
@@ -1608,8 +1740,39 @@ export default function App() {
             }}
             onUpdateUserPermissions={(u) => {
               const res = updateUserPermissionsTransaction(db, currentUser, u);
-              if (applyTxResult(res) && currentUser.id === u.id) {
-                setCurrentUser(u);
+              if (applyTxResult(res)) {
+                if (currentUser.id === u.id) {
+                  setCurrentUser(u);
+                }
+                if (cloudSessionActive) {
+                  void cloudApiService
+                    .saveCompanyUser({
+                      id: u.id,
+                      username: u.username,
+                      fullName: u.fullName,
+                      email: u.email,
+                      role: u.role,
+                      allowedCompanyIds: u.allowedCompanyIds,
+                      branchId: u.branchId,
+                      active: u.active,
+                      flags: {
+                        canViewReports: u.canViewReports,
+                        canPostEntries: u.canPostEntries,
+                        canAdjustInventory: u.canAdjustInventory,
+                        canViewCostsAndProfits: u.canViewCostsAndProfits,
+                        canManageSettings: u.canManageSettings,
+                        canEditInvoices: u.canEditInvoices,
+                        canDeleteInvoices: u.canDeleteInvoices,
+                        canEditVouchers: u.canEditVouchers,
+                        canDeleteVouchers: u.canDeleteVouchers,
+                        canEditExchangeRates: u.canEditExchangeRates,
+                      },
+                      permissionMatrix: u.permissionMatrix,
+                    })
+                    .catch((err) => {
+                      notify('error', err instanceof Error ? err.message : 'فشل مزامنة صلاحيات المستخدم مع الخادم.');
+                    });
+                }
               }
             }}
             onAddUser={(u) => {
@@ -1671,22 +1834,22 @@ export default function App() {
             </div>
 
             <div className="flex items-center gap-1.5 flex-wrap text-xs">
-              {/* Multi-Company Switcher + Onboarding Wizard Trigger */}
-              <div className="flex items-center gap-1 bg-[#060D15] border border-[var(--border-strong)] rounded-md px-2 py-1">
-                <Landmark className="w-3.5 h-3.5 text-[var(--gold)]" />
-                <select
-                  value={db.activeCompanyId || db.company.id}
-                  onChange={(e) => handleSwitchCompany(e.target.value)}
-                  className="bg-transparent text-white font-bold outline-none cursor-pointer max-w-[160px]"
-                  title="تبديل المنشأة / الشركة النشطة"
-                >
-                  {(authorizedCompanies.length > 0 ? authorizedCompanies : [db.company]).map((c) => (
-                    <option key={c.id} value={c.id} className="bg-[#071019]">
-                      {c.nameAr}
-                    </option>
-                  ))}
-                </select>
-                {currentUser.canManageSettings && (
+              {/* Multi-Company Switcher + Onboarding Wizard Trigger (STRICTLY Super Admin Only) */}
+              {isPlatformSuperAdmin(currentUser) ? (
+                <div className="flex items-center gap-1 bg-[#060D15] border border-[var(--border-strong)] rounded-md px-2 py-1">
+                  <Landmark className="w-3.5 h-3.5 text-[var(--gold)]" />
+                  <select
+                    value={db.activeCompanyId || db.company.id}
+                    onChange={(e) => void handleSwitchCompany(e.target.value)}
+                    className="bg-transparent text-white font-bold outline-none cursor-pointer max-w-[160px]"
+                    title="تبديل المنشأة / الشركة النشطة"
+                  >
+                    {authorizedCompanies.map((c) => (
+                      <option key={c.id} value={c.id} className="bg-[#071019]">
+                        {c.nameAr}
+                      </option>
+                    ))}
+                  </select>
                   <button
                     type="button"
                     onClick={() => setIsSetupWizardOpen(true)}
@@ -1695,8 +1858,15 @@ export default function App() {
                   >
                     + منشأة
                   </button>
-                )}
-              </div>
+                </div>
+              ) : (
+                <div className="flex items-center gap-1 bg-[#060D15] border border-[var(--border-strong)] rounded-md px-2 py-1">
+                  <Landmark className="w-3.5 h-3.5 text-[var(--gold)]" />
+                  <span className="text-white font-bold truncate max-w-[180px]" title={db.company.nameAr}>
+                    {db.company.nameAr}
+                  </span>
+                </div>
+              )}
 
               {/* Branch Switcher */}
               <div className="flex items-center gap-1 bg-[#060D15] border border-[var(--border-strong)] rounded-md px-2 py-1">
@@ -2111,19 +2281,34 @@ export default function App() {
       />
 
       <SetupWizardModal
-        isOpen={isSetupWizardOpen}
+        isOpen={isSetupWizardOpen && isPlatformSuperAdmin(currentUser)}
         db={db}
         currentUser={currentUser}
+        cloudSessionActive={cloudSessionActive}
         onClose={() => setIsSetupWizardOpen(false)}
         onCreateCompany={(nextDb: ERPDatabase, newCompany: Company) => {
-          setDb(nextDb);
+          const scopedNew = scopeDatabaseToCompany(
+            {
+              ...nextDb,
+              activeCompanyId: newCompany.id,
+              company: newCompany,
+            },
+            newCompany.id
+          );
+          cloudRevisionRef.current = nextDb.revision ?? 1;
+          skipNextCloudSaveRef.current = true;
+          setDb(scopedNew);
+          setCurrentUser((prev) => ({
+            ...prev,
+            allowedCompanyIds: Array.from(new Set([...(prev.allowedCompanyIds || []), newCompany.id])),
+          }));
           const nextBranch =
-            nextDb.branches.find((b) => b.companyId === newCompany.id) || nextDb.branches[0];
+            scopedNew.branches.find((b) => b.companyId === newCompany.id) || scopedNew.branches[0];
           if (nextBranch) setCurrentBranch(nextBranch);
           const baseCurr =
-            nextDb.currencies.find((c) => c.code === newCompany.baseCurrency) ||
-            nextDb.currencies.find((c) => c.isBase) ||
-            nextDb.currencies[0];
+            scopedNew.currencies.find((c) => c.code === newCompany.baseCurrency) ||
+            scopedNew.currencies.find((c) => c.isBase) ||
+            scopedNew.currencies[0];
           if (baseCurr) setCurrentCurrency(baseCurr);
         }}
         onNotify={notify}
@@ -2138,18 +2323,25 @@ export default function App() {
         pendingUserForPasswordChange={pendingPasswordChangeUser}
         canCancel={authCanCancel}
         lang={lang}
-        onBootstrapComplete={(updatedOwner) => {
-          setDb((prev) => ({
-            ...prev,
-            users: prev.users.map((u) => (u.id === updatedOwner.id ? updatedOwner : u)),
-          }));
+        onBootstrapComplete={async (updatedOwner) => {
+          const seedDb: ERPDatabase = {
+            ...db,
+            users: db.users.map((u) => (u.id === updatedOwner.id ? updatedOwner : u)),
+          };
+          setDb(seedDb);
+          try {
+            await hydrateWorkspaceFromCloud(seedDb);
+            setCloudSessionActive(true);
+          } catch {
+            // Keep local seed if offline
+          }
           setCurrentUser(updatedOwner);
           setIsAuthenticated(true);
           setAuthModalMode(null);
           setAuthCanCancel(false);
           notify('success', 'تم تفعيل حساب المالك وتأمين النظام بكلمة مرور مشفرة.');
         }}
-        onLoginSuccess={(loggedInUser, migrated) => {
+        onLoginSuccess={async (loggedInUser, migrated, meta) => {
           let resolvedUser = loggedInUser;
           if (migrated) {
             resolvedUser = {
@@ -2158,6 +2350,32 @@ export default function App() {
               passwordSalt: migrated.passwordSalt,
             };
           }
+
+          if (meta?.cloudAuthenticated) {
+            try {
+              const { hydratedDb } = await hydrateWorkspaceFromCloud();
+              const matched =
+                hydratedDb.users.find((u) => u.id === resolvedUser.id && u.active) || resolvedUser;
+              setCloudSessionActive(true);
+              if (matched.mustChangePassword) {
+                setPendingPasswordChangeUser(matched);
+                setIsAuthenticated(false);
+                setAuthModalMode('force_change_password');
+                return;
+              }
+              setCurrentUser(matched);
+              setIsAuthenticated(true);
+              setAuthModalMode(null);
+              setAuthCanCancel(false);
+              notify('success', `مرحباً ${matched.fullName}`);
+              return;
+            } catch (err: unknown) {
+              setIsAuthenticated(false);
+              notify('error', err instanceof Error ? err.message : 'تعذر تحميل بيانات المنشأة من الخادم.');
+              return;
+            }
+          }
+
           const activeCid = db.activeCompanyId || db.company.id;
           const allCompanies = db.companies && db.companies.length > 0 ? db.companies : [db.company];
           const canAccessActive = assertTenantAccess(resolvedUser, activeCid).ok;

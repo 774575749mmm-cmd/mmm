@@ -8,13 +8,15 @@ import 'dotenv/config';
 import fs from 'node:fs';
 import path from 'node:path';
 import express, { type Request, type Response } from 'express';
-import { createErpServerApp } from './server/app';
+import { createErpServerApp } from './server/app.ts';
+import { createServerDatabaseFromEnv } from './server/db.ts';
 
 const PORT = Number(process.env.PORT || 3000);
 const isProduction = process.env.NODE_ENV === 'production';
 
 async function startServer(): Promise<void> {
-  const app = createErpServerApp({ isProduction });
+  const db = await createServerDatabaseFromEnv();
+  const app = createErpServerApp({ isProduction, db });
 
   if (!isProduction) {
     const { createServer: createViteServer } = await import('vite');
@@ -29,7 +31,11 @@ async function startServer(): Promise<void> {
   } else {
     const distDir = path.resolve('dist');
     app.use(express.static(distDir));
-    app.get('/{*path}', (_req: Request, res: Response) => {
+    app.get('*', (req: Request, res: Response) => {
+      if (req.path.startsWith('/api/')) {
+        res.status(404).json({ ok: false, code: 'NOT_FOUND', error: 'API endpoint not found.' });
+        return;
+      }
       const indexFile = path.join(distDir, 'index.html');
       if (fs.existsSync(indexFile)) {
         res.sendFile(indexFile);

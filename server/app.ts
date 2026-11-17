@@ -2,7 +2,8 @@
  * @license
  * SPDX-License-Identifier: Apache-2.0
  * ALMANSOOR SMART FINANCE ERP - Hardened Express Application Factory
- * Auth (PBKDF2-SHA256 + HttpOnly Signed Cookies), RBAC, Rate Limiting, SSRF Guard, Gemini AI Proxy
+ * PostgreSQL Multi-Tenant Source of Truth, Auth (PBKDF2-SHA256 + HttpOnly Signed Cookies),
+ * RBAC (Super Admin vs Tenant Admin), Rate Limiting, SSRF Guard, Gemini AI Proxy
  */
 
 import fs from 'node:fs';
@@ -11,27 +12,23 @@ import crypto from 'node:crypto';
 import net from 'node:net';
 import express, { type Express, type Request, type Response, type NextFunction } from 'express';
 import { GoogleGenAI, Type } from '@google/genai';
+import type { PgExecutor } from './db.ts';
+import {
+  PgTenantRepository,
+  sanitizePublicServerUser,
+  type ServerUserRecord,
+  type PublicServerUser,
+  type ServerUserFlags,
+} from './tenantRepository.ts';
+import { evaluateLicenseBoundary } from '../src/services/licenseBoundaryService.ts';
 
-export interface ServerUserRecord {
-  id: string;
-  username: string;
-  fullName: string;
-  role: string;
-  allowedCompanyIds: string[];
-  branchId: string;
-  active: boolean;
-  passwordHash: string;
-  passwordSalt: string;
-  mustChangePassword?: boolean;
-  updatedAt: string;
-}
-
-export type PublicServerUser = Omit<ServerUserRecord, 'passwordHash' | 'passwordSalt'>;
+export type { ServerUserRecord, PublicServerUser, ServerUserFlags };
 
 export interface SessionPayload {
   userId: string;
   username: string;
   role: string;
+  isSuperAdmin?: boolean;
   companyId: string;
   allowedCompanyIds: string[];
   iat: number;
@@ -49,6 +46,7 @@ export interface ServerAppOptions {
   sessionSecret?: string;
   authStorePath?: string;
   inMemoryAuthStore?: boolean;
+  db?: PgExecutor;
   initialUsers?: ServerUserRecord[];
   rateLimits?: ServerRateLimits;
   whatsappFetchImpl?: typeof fetch;
@@ -61,6 +59,7 @@ const SESSION_TTL_MS = 12 * 60 * 60 * 1000;
 const AI_ALLOWED_ROLES = new Set([
   'مالك المؤسسة',
   'مدير النظام',
+  'Tenant Admin',
   'المدير المالي',
   'محاسب',
   'مسؤول المخزون',
@@ -71,13 +70,14 @@ const AI_ALLOWED_ROLES = new Set([
 const WHATSAPP_ALLOWED_ROLES = new Set([
   'مالك المؤسسة',
   'مدير النظام',
+  'Tenant Admin',
   'المدير المالي',
   'محاسب',
   'مسؤول المبيعات',
   'أمين الصندوق',
 ]);
 
-const ADMIN_ROLES = new Set(['مالك المؤسسة', 'مدير النظام']);
+const ADMIN_ROLES = new Set(['مالك المؤسسة', 'مدير النظام', 'Tenant Admin']);
 
 export function resolveSessionSecret(opts: { envSecret?: string; isProduction: boolean }): string {
   const raw = (opts.envSecret ?? process.env.ERP_SESSION_SECRET ?? '').trim();
@@ -145,17 +145,7 @@ export function verifyPasswordServer(password: string, storedHash: string, store
 }
 
 export function sanitizePublicUser(user: ServerUserRecord): PublicServerUser {
-  return {
-    id: user.id,
-    username: user.username,
-    fullName: user.fullName,
-    role: user.role,
-    allowedCompanyIds: [...(user.allowedCompanyIds || [])],
-    branchId: user.branchId,
-    active: user.active,
-    mustChangePassword: Boolean(user.mustChangePassword),
-    updatedAt: user.updatedAt,
-  };
+  return sanitizePublicServerUser(user);
 }
 
 function parseCookies(cookieHeader: string | undefined): Record<string, string> {
@@ -409,10 +399,12 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
     isProduction,
   });
 
-  const storePath = options.inMemoryAuthStore
-    ? null
-    : options.authStorePath || path.resolve('.erp-auth-users.json');
-  const authStore = new AuthUserStore(storePath, options.initialUsers);
+  const pgRepo = options.db ? new PgTenantRepository(options.db) : null;
+  const storePath =
+    pgRepo || options.inMemoryAuthStore
+      ? null
+      : options.authStorePath || path.resolve('.erp-auth-users.json');
+  const authStore = pgRepo ? null : new AuthUserStore(storePath, options.initialUsers);
 
   const signSessionToken = (payload: SessionPayload): string => {
     const encoded = Buffer.from(JSON.stringify(payload)).toString('base64url');
@@ -462,43 +454,87 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
     authUser?: ServerUserRecord;
   }
 
-  const requireAuth = (req: AuthenticatedRequest, res: Response, next: NextFunction): void => {
-    const token = extractToken(req);
-    if (!token) {
-      res.status(401).json({
+  const findUserByIdUnified = async (id: string): Promise<ServerUserRecord | undefined> => {
+    if (pgRepo) return pgRepo.findUserById(id);
+    return authStore!.findById(id);
+  };
+
+  const findUserByUsernameUnified = async (username: string): Promise<ServerUserRecord | undefined> => {
+    if (pgRepo) return pgRepo.findUserByUsername(username);
+    return authStore!.findByUsername(username);
+  };
+
+  const hasAnyUsersUnified = async (): Promise<boolean> => {
+    if (pgRepo) return pgRepo.hasAnyUsers();
+    return authStore!.hasAnyUsers();
+  };
+
+  const requireAuth = async (req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> => {
+    try {
+      const token = extractToken(req);
+      if (!token) {
+        res.status(401).json({
+          ok: false,
+          code: 'AUTH_REQUIRED',
+          error: 'جلسة العمل غير موجودة أو منتهية. يرجى تسجيل الدخول أولاً.',
+        });
+        return;
+      }
+      const verified = verifySessionToken(token);
+      if (!verified.valid) {
+        res.status(401).json({
+          ok: false,
+          code: 'INVALID_SESSION',
+          error: 'توكن الجلسة غير صالح أو منتهي الصلاحية.',
+        });
+        return;
+      }
+      const storedUser = await findUserByIdUnified(verified.payload.userId);
+      if (!storedUser || !storedUser.active) {
+        res.status(401).json({
+          ok: false,
+          code: 'ACCOUNT_DISABLED',
+          error: 'حساب المستخدم غير مفعل أو غير موجود.',
+        });
+        return;
+      }
+
+      // Derive authoritative company memberships from PostgreSQL, never trust stale cookie claims alone
+      const authoritativeAllowed = Array.isArray(storedUser.allowedCompanyIds)
+        ? storedUser.allowedCompanyIds
+        : [];
+      const sessionCompanyId = verified.payload.companyId;
+      const effectiveCompanyId =
+        sessionCompanyId && authoritativeAllowed.includes(sessionCompanyId)
+          ? sessionCompanyId
+          : storedUser.lastActiveCompanyId && authoritativeAllowed.includes(storedUser.lastActiveCompanyId)
+          ? storedUser.lastActiveCompanyId
+          : authoritativeAllowed[0] || '';
+
+      req.authSession = {
+        ...verified.payload,
+        role: storedUser.role,
+        isSuperAdmin: Boolean(storedUser.isSuperAdmin),
+        companyId: effectiveCompanyId,
+        allowedCompanyIds: authoritativeAllowed,
+      };
+      req.authUser = storedUser;
+      next();
+    } catch (err) {
+      res.status(500).json({
         ok: false,
-        code: 'AUTH_REQUIRED',
-        error: 'جلسة العمل غير موجودة أو منتهية. يرجى تسجيل الدخول أولاً.',
+        code: 'AUTH_VERIFICATION_FAILED',
+        error: err instanceof Error ? err.message : 'فشل التحقق من جلسة المستخدم.',
       });
-      return;
     }
-    const verified = verifySessionToken(token);
-    if (!verified.valid) {
-      res.status(401).json({
-        ok: false,
-        code: 'INVALID_SESSION',
-        error: 'توكن الجلسة غير صالح أو منتهي الصلاحية.',
-      });
-      return;
-    }
-    const storedUser = authStore.findById(verified.payload.userId);
-    if (!storedUser || !storedUser.active) {
-      res.status(401).json({
-        ok: false,
-        code: 'ACCOUNT_DISABLED',
-        error: 'حساب المستخدم غير مفعل أو غير موجود.',
-      });
-      return;
-    }
-    req.authSession = verified.payload;
-    req.authUser = storedUser;
-    next();
   };
 
   const requireRoles = (allowed: Set<string>) => {
     return (req: AuthenticatedRequest, res: Response, next: NextFunction): void => {
       const role = req.authUser?.role || '';
-      if (!allowed.has(role)) {
+      const hasSettingsFlag =
+        allowed === ADMIN_ROLES && Boolean(req.authUser?.flags?.canManageSettings);
+      if (!allowed.has(role) && !hasSettingsFlag) {
         res.status(403).json({
           ok: false,
           code: 'FORBIDDEN_ROLE',
@@ -510,8 +546,20 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
     };
   };
 
+  const requireSuperAdmin = (req: AuthenticatedRequest, res: Response, next: NextFunction): void => {
+    if (!req.authUser || req.authUser.isSuperAdmin !== true) {
+      res.status(403).json({
+        ok: false,
+        code: 'FORBIDDEN_SUPER_ADMIN_ONLY',
+        error: 'صلاحية مرفوضة: هذه الواجهة مخصصة لمدير المنصة المركزي (Super Admin) فقط.',
+      });
+      return;
+    }
+    next();
+  };
+
   const app = express();
-  app.use(express.json({ limit: '4mb' }));
+  app.use(express.json({ limit: '16mb' }));
 
   // Baseline HTTP Security Headers (OWASP ASVS alignment)
   app.use((_req: Request, res: Response, next: NextFunction) => {
@@ -522,22 +570,42 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
     next();
   });
 
-  const loginRateLimiter = createRateLimiter(options.rateLimits?.loginPerMinute ?? 15);
+  const loginRateLimiter = createRateLimiter(options.rateLimits?.loginPerMinute ?? 30);
   const aiRateLimiter = createRateLimiter(options.rateLimits?.aiPerMinute ?? 20);
   const whatsappRateLimiter = createRateLimiter(options.rateLimits?.whatsappPerMinute ?? 30);
 
-  // Health & readiness endpoint
-  app.get('/api/health', (_req: Request, res: Response) => {
-    const apiKey = (process.env.GEMINI_API_KEY || '').trim();
-    const aiConfigured = Boolean(apiKey && apiKey !== 'MY_GEMINI_API_KEY');
-    res.json({
-      ok: true,
-      service: 'almansoor-erp-server',
-      aiConfigured,
-      productionMode: isProduction,
-      authInitialized: authStore.hasAnyUsers(),
-      timestamp: new Date().toISOString(),
-    });
+  // Health & readiness endpoint (executes live DB check & non-secret RLS diagnostics)
+  app.get('/api/health', async (_req: Request, res: Response) => {
+    try {
+      const apiKey = (process.env.GEMINI_API_KEY || '').trim();
+      const aiConfigured = Boolean(apiKey && apiKey !== 'MY_GEMINI_API_KEY');
+      let rlsReady: boolean | null = null;
+      let rlsRoleRestricted: boolean | null = null;
+      if (options.db) {
+        await options.db.query('SELECT 1');
+        const rls = await options.db.checkRlsStatus();
+        rlsReady = rls.rlsTables.length > 0 && rls.rlsTables.every((t) => t.enabled && t.forced);
+        rlsRoleRestricted = (!rls.isSuperuser && !rls.bypassRls) || rls.enforcesViaAppRole;
+      }
+      const authInitialized = await hasAnyUsersUnified();
+      res.json({
+        ok: true,
+        service: 'almansoor-erp-server',
+        databaseDriver: options.db ? options.db.dialect : 'in_memory',
+        rlsReady,
+        rlsRoleRestricted,
+        aiConfigured,
+        production: isProduction,
+        productionMode: isProduction,
+        authInitialized,
+        timestamp: new Date().toISOString(),
+      });
+    } catch (err) {
+      res.status(503).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Health check failed',
+      });
+    }
   });
 
   // Legacy passwordless session minting endpoint is explicitly disabled
@@ -549,180 +617,417 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
     });
   });
 
-  app.get('/api/auth/status', (req: Request, res: Response) => {
-    const token = extractToken(req);
-    let activeUser: PublicServerUser | null = null;
-    if (token) {
-      const verified = verifySessionToken(token);
-      if (verified.valid) {
-        const u = authStore.findById(verified.payload.userId);
-        if (u && u.active) {
-          activeUser = sanitizePublicUser(u);
+  app.get('/api/auth/status', async (req: Request, res: Response) => {
+    try {
+      const token = extractToken(req);
+      let activeUser: PublicServerUser | null = null;
+      let activeCompanyId: string | null = null;
+      let companies: unknown[] = [];
+      let licenseBoundary = evaluateLicenseBoundary(null);
+
+      if (token) {
+        const verified = verifySessionToken(token);
+        if (verified.valid) {
+          const u = await findUserByIdUnified(verified.payload.userId);
+          if (u && u.active) {
+            activeUser = sanitizePublicUser(u);
+            if (pgRepo) {
+              const authCompanies = await pgRepo.getUserAuthorizedCompanies(u.id);
+              const allowedSet = new Set(authCompanies.map((c) => c.id));
+              activeCompanyId =
+                (verified.payload.companyId && allowedSet.has(verified.payload.companyId)
+                  ? verified.payload.companyId
+                  : null) ||
+                (u.lastActiveCompanyId && allowedSet.has(u.lastActiveCompanyId)
+                  ? u.lastActiveCompanyId
+                  : null) ||
+                u.companyId ||
+                authCompanies[0]?.id ||
+                null;
+              companies = u.isSuperAdmin
+                ? authCompanies
+                : authCompanies.filter((c) => c.id === activeCompanyId);
+              if (activeCompanyId) {
+                const st = await pgRepo.getCompanyState(u.id, activeCompanyId);
+                if (st.ok) {
+                  licenseBoundary = evaluateLicenseBoundary(st.snapshot.license);
+                }
+              }
+            } else {
+              activeCompanyId = verified.payload.companyId || u.allowedCompanyIds[0] || null;
+            }
+          }
         }
       }
+
+      const initialized = await hasAnyUsersUnified();
+      res.json({
+        ok: true,
+        initialized,
+        authenticated: Boolean(activeUser),
+        user: activeUser,
+        companies,
+        activeCompanyId,
+        licenseBoundary,
+      });
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Status check failed',
+      });
     }
-    res.json({
-      ok: true,
-      initialized: authStore.hasAnyUsers(),
-      authenticated: Boolean(activeUser),
-      user: activeUser,
-    });
   });
 
   // Initial Owner Account Bootstrap (ONLY allowed when zero server users exist)
-  app.post('/api/auth/bootstrap', (req: Request, res: Response) => {
-    if (authStore.hasAnyUsers()) {
-      res.status(403).json({
-        ok: false,
-        code: 'ALREADY_BOOTSTRAPPED',
-        error: 'النظام مهيأ مسبقاً بحساب مدير. يرجى تسجيل الدخول بكلمة المرور.',
+  app.post('/api/auth/bootstrap', async (req: Request, res: Response) => {
+    try {
+      if (await hasAnyUsersUnified()) {
+        res.status(403).json({
+          ok: false,
+          code: 'ALREADY_BOOTSTRAPPED',
+          error: 'النظام مهيأ مسبقاً بحساب مدير. يرجى تسجيل الدخول بكلمة المرور.',
+        });
+        return;
+      }
+
+      const body = (req.body || {}) as {
+        id?: string;
+        username?: string;
+        fullName?: string;
+        email?: string;
+        allowedCompanyIds?: string[];
+        branchId?: string;
+        password?: string;
+        company?: {
+          id?: string;
+          nameAr?: string;
+          nameEn?: string;
+          countryCode?: string;
+          baseCurrency?: string;
+        };
+        initialState?: Record<string, unknown>;
+      };
+
+      const username = String(body.username || 'admin').trim();
+      const fullName = String(body.fullName || 'مالك المؤسسة').trim();
+      const password = String(body.password || '');
+      const strength = validatePasswordStrengthServer(password);
+      if (!strength.ok) {
+        res.status(400).json({ ok: false, code: 'WEAK_PASSWORD', error: strength.error });
+        return;
+      }
+
+      const { hash, salt } = hashPasswordPbkdf2Server(password);
+      const allowedCompanyIds =
+        Array.isArray(body.allowedCompanyIds) && body.allowedCompanyIds.length > 0
+          ? body.allowedCompanyIds.map((c) => String(c).trim()).filter(Boolean)
+          : [body.company?.id || 'comp-01'];
+
+      const ownerRecord: ServerUserRecord = {
+        id: String(body.id || 'usr-01').trim(),
+        username,
+        fullName,
+        email: String(body.email || `${username}@almansoor.erp`).trim(),
+        role: 'مالك المؤسسة',
+        isSuperAdmin: true,
+        allowedCompanyIds,
+        branchId: String(body.branchId || 'br-01').trim(),
+        active: true,
+        passwordHash: hash,
+        passwordSalt: salt,
+        mustChangePassword: false,
+        lastActiveCompanyId: allowedCompanyIds[0] || 'comp-01',
+        flags: {
+          canViewReports: true,
+          canPostEntries: true,
+          canAdjustInventory: true,
+          canViewCostsAndProfits: true,
+          canManageSettings: true,
+          canEditInvoices: true,
+          canDeleteInvoices: true,
+          canEditVouchers: true,
+          canDeleteVouchers: true,
+          canEditExchangeRates: true,
+        },
+        updatedAt: new Date().toISOString(),
+      };
+
+      let createdCompanies: unknown[] = [];
+      if (pgRepo) {
+        const companyInputs = allowedCompanyIds.map((cid, idx) => ({
+          id: cid,
+          nameAr: idx === 0 ? body.company?.nameAr || 'مؤسسة المنصور للتجارة والاستثمار' : `منشأة ${cid}`,
+          nameEn: idx === 0 ? body.company?.nameEn || 'Almansoor Trading & Investment' : cid,
+          countryCode: idx === 0 ? body.company?.countryCode || 'YE' : 'YE',
+          baseCurrency: idx === 0 ? body.company?.baseCurrency || 'YER' : 'YER',
+        }));
+        const bootRes = await pgRepo.bootstrapOwner({
+          user: ownerRecord,
+          companies: companyInputs,
+          initialState: body.initialState,
+        });
+        if (!bootRes.ok) {
+          res.status(403).json({ ok: false, code: bootRes.code, error: bootRes.error });
+          return;
+        }
+        createdCompanies = bootRes.companies;
+      } else {
+        authStore!.upsertUser(ownerRecord);
+      }
+
+      const now = Date.now();
+      const activeCompanyId = allowedCompanyIds[0] || 'comp-01';
+      const token = signSessionToken({
+        userId: ownerRecord.id,
+        username: ownerRecord.username,
+        role: ownerRecord.role,
+        isSuperAdmin: true,
+        companyId: activeCompanyId,
+        allowedCompanyIds,
+        iat: now,
+        exp: now + SESSION_TTL_MS,
       });
-      return;
+
+      setSessionCookie(req, res, token, isProduction);
+      res.status(201).json({
+        ok: true,
+        user: sanitizePublicUser(ownerRecord),
+        companies: createdCompanies,
+        activeCompanyId,
+        licenseBoundary: evaluateLicenseBoundary(null),
+        expiresAt: new Date(now + SESSION_TTL_MS).toISOString(),
+      });
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Bootstrap failed',
+      });
     }
+  });
 
-    const body = (req.body || {}) as {
-      id?: string;
-      username?: string;
-      fullName?: string;
-      allowedCompanyIds?: string[];
-      branchId?: string;
-      password?: string;
-    };
+  // Independent Tenant Registration (creates an isolated account + optional new company with ZERO access to existing companies)
+  app.post('/api/auth/register', loginRateLimiter, async (req: Request, res: Response) => {
+    try {
+      if (!pgRepo) {
+        res.status(501).json({
+          ok: false,
+          code: 'POSTGRES_REQUIRED',
+          error: 'التسجيل المستقل للمنشآت يتطلب تفعيل قاعدة بيانات PostgreSQL.',
+        });
+        return;
+      }
 
-    const username = String(body.username || 'admin').trim();
-    const fullName = String(body.fullName || 'مالك المؤسسة').trim();
-    const password = String(body.password || '');
-    const strength = validatePasswordStrengthServer(password);
-    if (!strength.ok) {
-      res.status(400).json({ ok: false, code: 'WEAK_PASSWORD', error: strength.error });
-      return;
+      const body = (req.body || {}) as {
+        username?: string;
+        fullName?: string;
+        email?: string;
+        password?: string;
+        company?: {
+          id?: string;
+          nameAr?: string;
+          nameEn?: string;
+          countryCode?: string;
+          baseCurrency?: string;
+          valuationPolicy?: string;
+          commercialRecord?: string;
+          taxNumber?: string;
+          phone?: string;
+          address?: string;
+          fiscalYearStart?: string;
+          branchName?: string;
+          warehouseName?: string;
+        };
+        initialState?: Record<string, unknown>;
+      };
+
+      const username = String(body.username || '').trim();
+      const fullName = String(body.fullName || '').trim();
+      const password = String(body.password || '');
+
+      if (!username || !fullName) {
+        res.status(400).json({
+          ok: false,
+          code: 'MISSING_FIELDS',
+          error: 'يرجى إدخال اسم المستخدم والاسم الكامل.',
+        });
+        return;
+      }
+      const strength = validatePasswordStrengthServer(password);
+      if (!strength.ok) {
+        res.status(400).json({ ok: false, code: 'WEAK_PASSWORD', error: strength.error });
+        return;
+      }
+
+      const { hash, salt } = hashPasswordPbkdf2Server(password);
+      const regRes = await pgRepo.registerTenantAccount({
+        username,
+        fullName,
+        email: body.email,
+        passwordHash: hash,
+        passwordSalt: salt,
+        company:
+          body.company && body.company.nameAr && body.company.nameAr.trim()
+            ? {
+                ...body.company,
+                nameAr: body.company.nameAr.trim(),
+              }
+            : undefined,
+        initialState: body.initialState,
+      });
+
+      if (!regRes.ok) {
+        res.status(regRes.status).json({
+          ok: false,
+          code: regRes.code,
+          error: regRes.error,
+        });
+        return;
+      }
+
+      const now = Date.now();
+      const activeCompanyId = regRes.company?.id || null;
+      if (activeCompanyId) {
+        const token = signSessionToken({
+          userId: regRes.user.id,
+          username: regRes.user.username,
+          role: regRes.user.role,
+          isSuperAdmin: false,
+          companyId: activeCompanyId,
+          allowedCompanyIds: [activeCompanyId],
+          iat: now,
+          exp: now + SESSION_TTL_MS,
+        });
+        setSessionCookie(req, res, token, isProduction);
+      }
+
+      res.status(201).json({
+        ok: true,
+        user: sanitizePublicUser(regRes.user),
+        company: regRes.company,
+        companies: regRes.companies,
+        activeCompanyId,
+        licenseBoundary: evaluateLicenseBoundary(null),
+        expiresAt: new Date(now + SESSION_TTL_MS).toISOString(),
+      });
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Registration failed',
+      });
     }
-
-    const { hash, salt } = hashPasswordPbkdf2Server(password);
-    const allowedCompanyIds =
-      Array.isArray(body.allowedCompanyIds) && body.allowedCompanyIds.length > 0
-        ? body.allowedCompanyIds.map((c) => String(c).trim()).filter(Boolean)
-        : ['comp-01'];
-
-    const ownerRecord: ServerUserRecord = {
-      id: String(body.id || 'usr-01').trim(),
-      username,
-      fullName,
-      role: 'مالك المؤسسة',
-      allowedCompanyIds,
-      branchId: String(body.branchId || 'br-01').trim(),
-      active: true,
-      passwordHash: hash,
-      passwordSalt: salt,
-      mustChangePassword: false,
-      updatedAt: new Date().toISOString(),
-    };
-
-    authStore.upsertUser(ownerRecord);
-
-    const now = Date.now();
-    const token = signSessionToken({
-      userId: ownerRecord.id,
-      username: ownerRecord.username,
-      role: ownerRecord.role,
-      companyId: allowedCompanyIds[0] || 'comp-01',
-      allowedCompanyIds,
-      iat: now,
-      exp: now + SESSION_TTL_MS,
-    });
-
-    setSessionCookie(req, res, token, isProduction);
-    res.status(201).json({
-      ok: true,
-      user: sanitizePublicUser(ownerRecord),
-      expiresAt: new Date(now + SESSION_TTL_MS).toISOString(),
-    });
   });
 
   // Real Password-Verified Login
-  app.post('/api/auth/login', loginRateLimiter, (req: Request, res: Response) => {
-    const body = (req.body || {}) as {
-      username?: string;
-      userId?: string;
-      password?: string;
-      companyId?: string;
-    };
-    const username = String(body.username || '').trim();
-    const userId = String(body.userId || '').trim();
-    const password = String(body.password || '');
+  app.post('/api/auth/login', loginRateLimiter, async (req: Request, res: Response) => {
+    try {
+      const body = (req.body || {}) as {
+        username?: string;
+        userId?: string;
+        password?: string;
+        companyId?: string;
+      };
+      const username = String(body.username || '').trim();
+      const userId = String(body.userId || '').trim();
+      const password = String(body.password || '');
 
-    if ((!username && !userId) || !password) {
-      res.status(400).json({
-        ok: false,
-        code: 'MISSING_CREDENTIALS',
-        error: 'يرجى إدخال اسم المستخدم وكلمة المرور.',
+      if ((!username && !userId) || !password) {
+        res.status(400).json({
+          ok: false,
+          code: 'MISSING_CREDENTIALS',
+          error: 'يرجى إدخال اسم المستخدم وكلمة المرور.',
+        });
+        return;
+      }
+
+      const record = userId
+        ? await findUserByIdUnified(userId)
+        : await findUserByUsernameUnified(username);
+
+      if (!record) {
+        res.status(401).json({
+          ok: false,
+          code: 'INVALID_CREDENTIALS',
+          error: 'اسم المستخدم أو كلمة المرور غير صحيحة أو الحساب موقوف.',
+        });
+        return;
+      }
+      if (!record.active) {
+        res.status(401).json({
+          ok: false,
+          code: 'ACCOUNT_DISABLED',
+          error: 'حساب المستخدم موقوف إدارياً ولا يمكنه تسجيل الدخول.',
+        });
+        return;
+      }
+
+      const passwordValid = verifyPasswordServer(password, record.passwordHash, record.passwordSalt);
+      if (!passwordValid) {
+        res.status(401).json({
+          ok: false,
+          code: 'INVALID_CREDENTIALS',
+          error: 'اسم المستخدم أو كلمة المرور غير صحيحة.',
+        });
+        return;
+      }
+
+      const allowedCompanies = Array.isArray(record.allowedCompanyIds)
+        ? record.allowedCompanyIds.map((c) => String(c).trim()).filter(Boolean)
+        : [];
+      if (allowedCompanies.length === 0) {
+        res.status(403).json({
+          ok: false,
+          code: 'NO_COMPANY_ACCESS',
+          error: 'عذراً، هذا الحساب لا يملك صلاحية الوصول إلى أي منشأة.',
+        });
+        return;
+      }
+
+      const requestedCompany = String(body.companyId || '').trim();
+      const activeCompanyId =
+        requestedCompany && allowedCompanies.includes(requestedCompany)
+          ? requestedCompany
+          : record.lastActiveCompanyId && allowedCompanies.includes(record.lastActiveCompanyId)
+          ? record.lastActiveCompanyId
+          : allowedCompanies[0];
+
+      let companies: unknown[] = [];
+      let licenseBoundary = evaluateLicenseBoundary(null);
+      if (pgRepo) {
+        await pgRepo.updateLastActiveCompany(record.id, activeCompanyId);
+        companies = await pgRepo.getUserAuthorizedCompanies(record.id);
+        const st = await pgRepo.getCompanyState(record.id, activeCompanyId);
+        if (st.ok) {
+          licenseBoundary = evaluateLicenseBoundary(st.snapshot.license);
+        }
+      }
+
+      const now = Date.now();
+      const token = signSessionToken({
+        userId: record.id,
+        username: record.username,
+        role: record.role,
+        isSuperAdmin: Boolean(record.isSuperAdmin),
+        companyId: activeCompanyId,
+        allowedCompanyIds: allowedCompanies,
+        iat: now,
+        exp: now + SESSION_TTL_MS,
       });
-      return;
-    }
 
-    const record = userId ? authStore.findById(userId) : authStore.findByUsername(username);
-    if (!record) {
-      res.status(401).json({
-        ok: false,
-        code: 'INVALID_CREDENTIALS',
-        error: 'اسم المستخدم أو كلمة المرور غير صحيحة أو الحساب موقوف.',
+      setSessionCookie(req, res, token, isProduction);
+      res.json({
+        ok: true,
+        user: sanitizePublicUser({ ...record, lastActiveCompanyId: activeCompanyId }),
+        companies,
+        activeCompanyId,
+        licenseBoundary,
+        expiresAt: new Date(now + SESSION_TTL_MS).toISOString(),
       });
-      return;
-    }
-    if (!record.active) {
-      res.status(401).json({
+    } catch (err) {
+      res.status(500).json({
         ok: false,
-        code: 'ACCOUNT_DISABLED',
-        error: 'حساب المستخدم موقوف إدارياً ولا يمكنه تسجيل الدخول.',
+        error: err instanceof Error ? err.message : 'Login error',
       });
-      return;
     }
-
-    const passwordValid = verifyPasswordServer(password, record.passwordHash, record.passwordSalt);
-    if (!passwordValid) {
-      res.status(401).json({
-        ok: false,
-        code: 'INVALID_CREDENTIALS',
-        error: 'اسم المستخدم أو كلمة المرور غير صحيحة.',
-      });
-      return;
-    }
-
-    const allowedCompanies = Array.isArray(record.allowedCompanyIds)
-      ? record.allowedCompanyIds.map((c) => String(c).trim()).filter(Boolean)
-      : [];
-    if (allowedCompanies.length === 0) {
-      res.status(403).json({
-        ok: false,
-        code: 'NO_COMPANY_ACCESS',
-        error: 'عذراً، هذا الحساب لا يملك صلاحية الوصول إلى أي منشأة.',
-      });
-      return;
-    }
-
-    const requestedCompany = String(body.companyId || '').trim();
-    const activeCompanyId =
-      requestedCompany && allowedCompanies.includes(requestedCompany)
-        ? requestedCompany
-        : allowedCompanies[0];
-
-    const now = Date.now();
-    const token = signSessionToken({
-      userId: record.id,
-      username: record.username,
-      role: record.role,
-      companyId: activeCompanyId,
-      allowedCompanyIds: allowedCompanies,
-      iat: now,
-      exp: now + SESSION_TTL_MS,
-    });
-
-    setSessionCookie(req, res, token, isProduction);
-    res.json({
-      ok: true,
-      user: sanitizePublicUser(record),
-      expiresAt: new Date(now + SESSION_TTL_MS).toISOString(),
-    });
   });
 
   app.post('/api/auth/logout', (req: Request, res: Response) => {
@@ -738,22 +1043,516 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
     });
   });
 
-  // Admin-only Server User Provisioning / Password Reset Sync
+  // =========================================================================
+  // PostgreSQL Authoritative Multi-Company Endpoints
+  // =========================================================================
+
+  app.get('/api/companies', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      if (!pgRepo) {
+        res.status(501).json({
+          ok: false,
+          code: 'POSTGRES_REQUIRED',
+          error: 'إدارة المنشآت تتطلب تفعيل PostgreSQL.',
+        });
+        return;
+      }
+      const user = req.authUser!;
+      const allAuthorized = await pgRepo.getUserAuthorizedCompanies(user.id);
+      const allowedSet = new Set(allAuthorized.map((c) => c.id));
+      const activeCompanyId =
+        (req.authSession?.companyId && allowedSet.has(req.authSession.companyId)
+          ? req.authSession.companyId
+          : null) ||
+        (user.lastActiveCompanyId && allowedSet.has(user.lastActiveCompanyId)
+          ? user.lastActiveCompanyId
+          : null) ||
+        user.companyId ||
+        allAuthorized[0]?.id ||
+        null;
+
+      const visibleCompanies = user.isSuperAdmin
+        ? allAuthorized
+        : allAuthorized.filter((c) => c.id === activeCompanyId);
+
+      res.json({
+        ok: true,
+        companies: visibleCompanies,
+        activeCompanyId,
+      });
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Failed loading companies',
+      });
+    }
+  });
+
+  // Only Platform Super Admin (مالك المؤسسة) may create additional companies
   app.post(
-    '/api/auth/users',
+    '/api/companies',
+    requireAuth,
+    requireSuperAdmin,
+    async (req: AuthenticatedRequest, res: Response) => {
+      try {
+        if (!pgRepo) {
+          res.status(501).json({
+            ok: false,
+            code: 'POSTGRES_REQUIRED',
+            error: 'تأسيس وحفظ المنشآت يتطلب قاعدة بيانات PostgreSQL.',
+          });
+          return;
+        }
+        const actor = req.authUser!;
+        const body = (req.body || {}) as {
+          id?: string;
+          nameAr?: string;
+          nameEn?: string;
+          countryCode?: string;
+          baseCurrency?: string;
+          valuationPolicy?: string;
+          commercialRecord?: string;
+          taxNumber?: string;
+          phone?: string;
+          email?: string;
+          address?: string;
+          fiscalYearStart?: string;
+          branchName?: string;
+          warehouseName?: string;
+          initialState?: Record<string, unknown>;
+        };
+
+        const nameAr = String(body.nameAr || '').trim();
+        if (!nameAr) {
+          res.status(400).json({
+            ok: false,
+            code: 'COMPANY_NAME_REQUIRED',
+            error: 'اسم المنشأة بالعربية مطلوب.',
+          });
+          return;
+        }
+
+        const createRes = await pgRepo.createCompanyForUser({
+          actor,
+          company: {
+            id: body.id,
+            nameAr,
+            nameEn: body.nameEn,
+            countryCode: body.countryCode,
+            baseCurrency: body.baseCurrency,
+            valuationPolicy: body.valuationPolicy,
+            commercialRecord: body.commercialRecord,
+            taxNumber: body.taxNumber,
+            phone: body.phone,
+            email: body.email,
+            address: body.address,
+            fiscalYearStart: body.fiscalYearStart,
+            branchName: body.branchName,
+            warehouseName: body.warehouseName,
+          },
+          initialState: body.initialState,
+        });
+
+        if (!createRes.ok) {
+          res.status(createRes.status).json({
+            ok: false,
+            code: createRes.code,
+            error: createRes.error,
+          });
+          return;
+        }
+
+        const now = Date.now();
+        const allowedIds = createRes.companies.map((c) => c.id);
+        const token = signSessionToken({
+          userId: actor.id,
+          username: actor.username,
+          role: actor.role,
+          isSuperAdmin: Boolean(actor.isSuperAdmin),
+          companyId: createRes.company.id,
+          allowedCompanyIds: allowedIds,
+          iat: now,
+          exp: now + SESSION_TTL_MS,
+        });
+        setSessionCookie(req, res, token, isProduction);
+
+        res.status(201).json({
+          ok: true,
+          company: createRes.company,
+          companies: createRes.companies,
+          activeCompanyId: createRes.company.id,
+          revision: createRes.revision,
+          licenseBoundary: evaluateLicenseBoundary({ companyId: createRes.company.id }),
+        });
+      } catch (err) {
+        res.status(500).json({
+          ok: false,
+          error: err instanceof Error ? err.message : 'Failed creating company',
+        });
+      }
+    }
+  );
+
+  // Tenant Admin can update own company profile in PostgreSQL; Super Admin can update any company
+  app.put(
+    '/api/companies/:id',
     requireAuth,
     requireRoles(ADMIN_ROLES),
-    (req: AuthenticatedRequest, res: Response) => {
+    async (req: AuthenticatedRequest, res: Response) => {
+      try {
+        if (!pgRepo) {
+          res.status(501).json({ ok: false, code: 'POSTGRES_REQUIRED', error: 'PostgreSQL required.' });
+          return;
+        }
+        const actor = req.authUser!;
+        const targetCompanyId = String(req.params.id || '').trim();
+        const sessionCompanyId = req.authSession?.companyId || '';
+
+        if (!targetCompanyId) {
+          res.status(400).json({ ok: false, code: 'COMPANY_ID_REQUIRED', error: 'معرف المنشأة مطلوب.' });
+          return;
+        }
+
+        if (!actor.isSuperAdmin && targetCompanyId !== sessionCompanyId) {
+          res.status(403).json({
+            ok: false,
+            code: 'TENANT_ISOLATION_VIOLATION',
+            error: 'عزل المنشآت: لا تملك صلاحية تعديل منشأة خارج جلستك الحالية.',
+          });
+          return;
+        }
+
+        const body = (req.body || {}) as {
+          nameAr?: string;
+          nameEn?: string;
+          countryCode?: string;
+          baseCurrency?: string;
+          valuationPolicy?: string;
+          commercialRecord?: string;
+          taxNumber?: string;
+          phone?: string;
+          email?: string;
+          address?: string;
+          fiscalYearStart?: string;
+          status?: string;
+        };
+
+        const updateRes = await pgRepo.updateCompanyProfile({
+          actor,
+          companyId: targetCompanyId,
+          patch: body,
+        });
+
+        if (!updateRes.ok) {
+          res.status(updateRes.status).json({
+            ok: false,
+            code: updateRes.code,
+            error: updateRes.error,
+          });
+          return;
+        }
+
+        res.json({
+          ok: true,
+          company: updateRes.company,
+        });
+      } catch (err) {
+        res.status(500).json({
+          ok: false,
+          error: err instanceof Error ? err.message : 'Failed updating company',
+        });
+      }
+    }
+  );
+
+  // Only Platform Super Admin (مالك المؤسسة) may activate/suspend company subscriptions
+  app.patch(
+    '/api/companies/:id/status',
+    requireAuth,
+    requireSuperAdmin,
+    async (req: AuthenticatedRequest, res: Response) => {
+      try {
+        if (!pgRepo) {
+          res.status(501).json({ ok: false, code: 'POSTGRES_REQUIRED', error: 'PostgreSQL required.' });
+          return;
+        }
+        const actor = req.authUser!;
+        const targetCompanyId = String(req.params.id || '').trim();
+        const body = (req.body || {}) as { status?: string; active?: boolean };
+        const rawStatus =
+          body.status || (body.active === false ? 'suspended' : body.active === true ? 'active' : '');
+        const cleanStatus =
+          rawStatus === 'active' || rawStatus === 'inactive' || rawStatus === 'suspended'
+            ? rawStatus
+            : null;
+
+        if (!targetCompanyId || !cleanStatus) {
+          res.status(400).json({
+            ok: false,
+            code: 'INVALID_STATUS',
+            error: 'حالة اشتراك المنشأة غير صالحة (المسموح: active, inactive, suspended).',
+          });
+          return;
+        }
+
+        const statusRes = await pgRepo.setCompanySubscriptionStatus({
+          actor,
+          companyId: targetCompanyId,
+          status: cleanStatus,
+        });
+
+        if (!statusRes.ok) {
+          res.status(statusRes.status).json({
+            ok: false,
+            code: statusRes.code,
+            error: statusRes.error,
+          });
+          return;
+        }
+
+        res.json({
+          ok: true,
+          company: statusRes.company,
+          license: statusRes.license,
+        });
+      } catch (err) {
+        res.status(500).json({
+          ok: false,
+          error: err instanceof Error ? err.message : 'Failed updating company subscription status',
+        });
+      }
+    }
+  );
+
+  // Only Platform Super Admin (مالك المؤسسة) may switch between companies
+  app.post(
+    '/api/companies/switch',
+    requireAuth,
+    requireSuperAdmin,
+    async (req: AuthenticatedRequest, res: Response) => {
+      try {
+        if (!pgRepo) {
+          res.status(501).json({ ok: false, code: 'POSTGRES_REQUIRED', error: 'PostgreSQL required.' });
+          return;
+        }
+        const actor = req.authUser!;
+        const body = (req.body || {}) as { companyId?: string };
+        const targetCompanyId = String(body.companyId || '').trim();
+        if (!targetCompanyId) {
+          res.status(400).json({
+            ok: false,
+            code: 'COMPANY_ID_REQUIRED',
+            error: 'معرف المنشأة المستهدفة مطلوب.',
+          });
+          return;
+        }
+
+        const switchRes = await pgRepo.switchActiveCompany(actor.id, targetCompanyId);
+        if (!switchRes.ok) {
+          res.status(switchRes.status).json({
+            ok: false,
+            code: switchRes.code,
+            error: switchRes.error,
+          });
+          return;
+        }
+
+        const now = Date.now();
+        const allowedIds = switchRes.companies.map((c) => c.id);
+        const token = signSessionToken({
+          userId: actor.id,
+          username: actor.username,
+          role: switchRes.membershipRole || actor.role,
+          isSuperAdmin: Boolean(actor.isSuperAdmin),
+          companyId: switchRes.company.id,
+          allowedCompanyIds: allowedIds,
+          iat: now,
+          exp: now + SESSION_TTL_MS,
+        });
+        setSessionCookie(req, res, token, isProduction);
+
+        res.json({
+          ok: true,
+          activeCompanyId: switchRes.company.id,
+          company: switchRes.company,
+          companies: switchRes.companies,
+        });
+      } catch (err) {
+        res.status(500).json({
+          ok: false,
+          error: err instanceof Error ? err.message : 'Failed switching company',
+        });
+      }
+    }
+  );
+
+  app.get('/api/company/state', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      if (!pgRepo) {
+        res.status(501).json({ ok: false, code: 'POSTGRES_REQUIRED', error: 'PostgreSQL required.' });
+        return;
+      }
+      const sessionCompanyId = req.authSession?.companyId || '';
+      const requestedQueryCid = String(req.query?.companyId || req.headers['x-company-id'] || '').trim();
+
+      if (!sessionCompanyId) {
+        res.status(403).json({
+          ok: false,
+          code: 'NO_COMPANY_ACCESS',
+          error: 'عذراً، هذا الحساب لا يملك منشأة نشطة مصرح بها.',
+        });
+        return;
+      }
+      if (requestedQueryCid && requestedQueryCid !== sessionCompanyId) {
+        res.status(403).json({
+          ok: false,
+          code: 'TENANT_ISOLATION_VIOLATION',
+          error: `عزل المنشآت: محاولة الوصول غير المصرح بها لمنشأة (${requestedQueryCid}) من جلسة (${sessionCompanyId}).`,
+        });
+        return;
+      }
+
+      const stateRes = await pgRepo.getCompanyState(req.authUser!.id, sessionCompanyId);
+      if (!stateRes.ok) {
+        res.status(stateRes.status).json({
+          ok: false,
+          code: stateRes.code,
+          error: stateRes.error,
+        });
+        return;
+      }
+
+      res.json({
+        ok: true,
+        ...stateRes.snapshot,
+        licenseBoundary: evaluateLicenseBoundary(stateRes.snapshot.license),
+      });
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Failed loading company state',
+      });
+    }
+  });
+
+  app.put('/api/company/state', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      if (!pgRepo) {
+        res.status(501).json({ ok: false, code: 'POSTGRES_REQUIRED', error: 'PostgreSQL required.' });
+        return;
+      }
+      const sessionCompanyId = req.authSession?.companyId || '';
+      if (!sessionCompanyId) {
+        res.status(403).json({
+          ok: false,
+          code: 'NO_COMPANY_ACCESS',
+          error: 'عذراً، هذا الحساب لا يملك منشأة نشطة مصرح بها.',
+        });
+        return;
+      }
+
+      const body = (req.body || {}) as {
+        companyId?: string;
+        activeCompanyId?: string;
+        expectedRevision?: number;
+        state?: Record<string, unknown>;
+      };
+
+      const bodyCid = String(body.companyId || '').trim();
+      const bodyActiveCid = String(body.activeCompanyId || '').trim();
+      const headerCid = String(req.headers['x-company-id'] || '').trim();
+      if (
+        (bodyCid && bodyCid !== sessionCompanyId) ||
+        (bodyActiveCid && bodyActiveCid !== sessionCompanyId) ||
+        (headerCid && headerCid !== sessionCompanyId)
+      ) {
+        res.status(403).json({
+          ok: false,
+          code: 'TENANT_ISOLATION_VIOLATION',
+          error: 'عزل المنشآت: تم رفض محاولة تمرير معرف منشأة مخالف للجلسة الموثقة.',
+        });
+        return;
+      }
+
+      const stateObj =
+        body.state && typeof body.state === 'object'
+          ? body.state
+          : (body as Record<string, unknown>);
+
+      const saveRes = await pgRepo.saveCompanyState({
+        userId: req.authUser!.id,
+        companyId: sessionCompanyId,
+        state: stateObj,
+        expectedRevision:
+          typeof body.expectedRevision === 'number' ? body.expectedRevision : undefined,
+      });
+
+      if (!saveRes.ok) {
+        res.status(saveRes.status).json({
+          ok: false,
+          code: saveRes.code,
+          error: saveRes.error,
+          serverRevision: saveRes.serverRevision,
+        });
+        return;
+      }
+
+      res.json({
+        ok: true,
+        companyId: saveRes.companyId,
+        revision: saveRes.revision,
+      });
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Failed saving company state',
+      });
+    }
+  });
+
+  // Tenant-Scoped User Management (strictly restricted to active session companyId)
+  app.get('/api/company/users', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      if (!pgRepo) {
+        res.status(501).json({ ok: false, code: 'POSTGRES_REQUIRED', error: 'PostgreSQL required.' });
+        return;
+      }
+      const sessionCompanyId = req.authSession?.companyId || '';
+      if (!sessionCompanyId) {
+        res.status(403).json({ ok: false, code: 'NO_COMPANY_ACCESS', error: 'لا توجد منشأة نشطة.' });
+        return;
+      }
+      const listRes = await pgRepo.listCompanyUsers(req.authUser!.id, sessionCompanyId);
+      if (!listRes.ok) {
+        res.status(listRes.status).json({ ok: false, code: listRes.code, error: listRes.error });
+        return;
+      }
+      res.json({ ok: true, companyId: sessionCompanyId, users: listRes.users });
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Failed listing company users',
+      });
+    }
+  });
+
+  const handleUpsertScopedUser = async (req: AuthenticatedRequest, res: Response): Promise<void> => {
+    try {
       const body = (req.body || {}) as {
         id?: string;
         username?: string;
         fullName?: string;
+        email?: string;
         role?: string;
+        isSuperAdmin?: boolean;
         allowedCompanyIds?: string[];
         branchId?: string;
         active?: boolean;
         password?: string;
         mustChangePassword?: boolean;
+        flags?: ServerUserFlags;
+        permissionMatrix?: Record<string, unknown>;
+        companyId?: string;
       };
 
       const id = String(body.id || '').trim();
@@ -765,7 +1564,88 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
         return;
       }
 
-      const existing = authStore.findById(id);
+      // Block privilege escalation to Super Admin by Tenant Admin / non-Super-Admin
+      if ((body.isSuperAdmin || role === 'مالك المؤسسة') && !req.authUser?.isSuperAdmin) {
+        res.status(403).json({
+          ok: false,
+          code: 'FORBIDDEN_SUPER_ADMIN_ESCALATION',
+          error: 'صلاحية مرفوضة: مدير المنشأة لا يملك صلاحية منح صفة Super Admin أو دور مالك المؤسسة.',
+        });
+        return;
+      }
+
+      if (pgRepo) {
+        const sessionCompanyId = req.authSession?.companyId || '';
+        const targetBodyCompany = String(body.companyId || '').trim();
+        if (targetBodyCompany && targetBodyCompany !== sessionCompanyId) {
+          res.status(403).json({
+            ok: false,
+            code: 'TENANT_ISOLATION_VIOLATION',
+            error: 'عزل المنشآت: لا يمكنك إدارة مستخدم لمنشأة خارج جلستك الحالية.',
+          });
+          return;
+        }
+        if (!sessionCompanyId) {
+          res.status(403).json({
+            ok: false,
+            code: 'NO_COMPANY_ACCESS',
+            error: 'حساب الإدارة لا يملك صلاحية الوصول لأي منشأة.',
+          });
+          return;
+        }
+
+        let passwordHash: string | undefined;
+        let passwordSalt: string | undefined;
+        if (body.password !== undefined && body.password !== '') {
+          const strength = validatePasswordStrengthServer(String(body.password));
+          if (!strength.ok) {
+            res.status(400).json({ ok: false, code: 'WEAK_PASSWORD', error: strength.error });
+            return;
+          }
+          const hashed = hashPasswordPbkdf2Server(String(body.password));
+          passwordHash = hashed.hash;
+          passwordSalt = hashed.salt;
+        }
+
+        const upsertRes = await pgRepo.upsertCompanyUser({
+          actor: req.authUser!,
+          companyId: sessionCompanyId,
+          targetUser: {
+            id,
+            username,
+            fullName,
+            email: body.email,
+            role,
+            isSuperAdmin: Boolean(req.authUser?.isSuperAdmin && body.isSuperAdmin),
+            allowedCompanyIds: body.allowedCompanyIds,
+            branchId: body.branchId,
+            active: body.active,
+            passwordHash,
+            passwordSalt,
+            mustChangePassword: body.mustChangePassword,
+            flags: body.flags,
+            permissionMatrix: body.permissionMatrix,
+          },
+        });
+
+        if (!upsertRes.ok) {
+          res.status(upsertRes.status).json({
+            ok: false,
+            code: upsertRes.code,
+            error: upsertRes.error,
+          });
+          return;
+        }
+
+        res.status(upsertRes.created ? 201 : 200).json({
+          ok: true,
+          user: upsertRes.user,
+        });
+        return;
+      }
+
+      // In-memory store path (preserves legacy unit tests cleanly)
+      const existing = authStore!.findById(id);
       let passwordHash = existing?.passwordHash || '';
       let passwordSalt = existing?.passwordSalt || '';
 
@@ -791,7 +1671,11 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
         ? req.authUser!.allowedCompanyIds.map((c) => String(c).trim()).filter(Boolean)
         : [];
       if (actorAllowed.length === 0) {
-        res.status(403).json({ ok: false, code: 'NO_COMPANY_ACCESS', error: 'حساب الإدارة لا يملك صلاحية الوصول لأي منشأة.' });
+        res.status(403).json({
+          ok: false,
+          code: 'NO_COMPANY_ACCESS',
+          error: 'حساب الإدارة لا يملك صلاحية الوصول لأي منشأة.',
+        });
         return;
       }
 
@@ -799,11 +1683,24 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
         ? body.allowedCompanyIds.map((c) => String(c).trim()).filter(Boolean)
         : existing?.allowedCompanyIds || [];
 
+      if (
+        !req.authUser?.isSuperAdmin &&
+        nextAllowedCompanyIds.some((cid) => !actorAllowed.includes(cid))
+      ) {
+        res.status(403).json({
+          ok: false,
+          code: 'TENANT_ISOLATION_VIOLATION',
+          error: 'عزل المنشآت: لا يمكنك إسناد مستخدم لمنشأة لا تملك صلاحيتها.',
+        });
+        return;
+      }
+
       const nextRecord: ServerUserRecord = {
         id,
         username,
         fullName,
         role,
+        isSuperAdmin: Boolean(req.authUser?.isSuperAdmin && body.isSuperAdmin),
         allowedCompanyIds: nextAllowedCompanyIds,
         branchId: String(body.branchId || existing?.branchId || 'br-01').trim(),
         active: body.active !== undefined ? Boolean(body.active) : existing?.active !== false,
@@ -816,40 +1713,102 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
         updatedAt: new Date().toISOString(),
       };
 
-      authStore.upsertUser(nextRecord);
+      authStore!.upsertUser(nextRecord);
       res.status(existing ? 200 : 201).json({
         ok: true,
         user: sanitizePublicUser(nextRecord),
       });
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Failed saving user',
+      });
     }
-  );
+  };
 
-  app.post('/api/auth/change-password', requireAuth, (req: AuthenticatedRequest, res: Response) => {
-    const user = req.authUser!;
-    const body = (req.body || {}) as { currentPassword?: string; newPassword?: string };
-    const currentPassword = String(body.currentPassword || '');
-    const newPassword = String(body.newPassword || '');
+  app.post('/api/company/users', requireAuth, requireRoles(ADMIN_ROLES), handleUpsertScopedUser);
+  app.post('/api/auth/users', requireAuth, requireRoles(ADMIN_ROLES), handleUpsertScopedUser);
 
-    if (!verifyPasswordServer(currentPassword, user.passwordHash, user.passwordSalt)) {
-      res.status(401).json({ ok: false, error: 'كلمة المرور الحالية غير صحيحة.' });
-      return;
+  app.post('/api/auth/change-password', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const user = req.authUser!;
+      const body = (req.body || {}) as { currentPassword?: string; newPassword?: string };
+      const currentPassword = String(body.currentPassword || '');
+      const newPassword = String(body.newPassword || '');
+
+      if (!verifyPasswordServer(currentPassword, user.passwordHash, user.passwordSalt)) {
+        res.status(401).json({ ok: false, error: 'كلمة المرور الحالية غير صحيحة.' });
+        return;
+      }
+      const strength = validatePasswordStrengthServer(newPassword);
+      if (!strength.ok) {
+        res.status(400).json({ ok: false, code: 'WEAK_PASSWORD', error: strength.error });
+        return;
+      }
+
+      const hashed = hashPasswordPbkdf2Server(newPassword);
+      if (pgRepo) {
+        await pgRepo.updateUserPassword(user.id, hashed.hash, hashed.salt);
+      } else {
+        authStore!.upsertUser({
+          ...user,
+          passwordHash: hashed.hash,
+          passwordSalt: hashed.salt,
+          mustChangePassword: false,
+          updatedAt: new Date().toISOString(),
+        });
+      }
+
+      res.json({
+        ok: true,
+        user: sanitizePublicUser({
+          ...user,
+          mustChangePassword: false,
+          updatedAt: new Date().toISOString(),
+        }),
+      });
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Password change failed',
+      });
     }
-    const strength = validatePasswordStrengthServer(newPassword);
-    if (!strength.ok) {
-      res.status(400).json({ ok: false, code: 'WEAK_PASSWORD', error: strength.error });
-      return;
-    }
+  });
 
-    const hashed = hashPasswordPbkdf2Server(newPassword);
-    const updated: ServerUserRecord = {
-      ...user,
-      passwordHash: hashed.hash,
-      passwordSalt: hashed.salt,
-      mustChangePassword: false,
-      updatedAt: new Date().toISOString(),
-    };
-    authStore.upsertUser(updated);
-    res.json({ ok: true, user: sanitizePublicUser(updated) });
+  // =========================================================================
+  // Platform Super Admin Only Endpoints (Blocked 403 for Tenant Admin)
+  // =========================================================================
+
+  app.get('/api/admin/overview', requireAuth, requireSuperAdmin, async (_req: AuthenticatedRequest, res: Response) => {
+    try {
+      if (!pgRepo) {
+        res.json({ ok: true, totalCompanies: 0, totalUsers: 0, companies: [] });
+        return;
+      }
+      const overview = await pgRepo.getAdminOverview();
+      res.json({ ok: true, ...overview });
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Admin overview failed',
+      });
+    }
+  });
+
+  app.get('/api/admin/companies', requireAuth, requireSuperAdmin, async (_req: AuthenticatedRequest, res: Response) => {
+    try {
+      if (!pgRepo) {
+        res.json({ ok: true, companies: [] });
+        return;
+      }
+      const overview = await pgRepo.getAdminOverview();
+      res.json({ ok: true, companies: overview.companies });
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Admin companies failed',
+      });
+    }
   });
 
   // Protected WhatsApp Cloud API Dispatch Proxy with strict SSRF protection, RBAC & Rate Limit

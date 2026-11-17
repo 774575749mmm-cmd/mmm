@@ -721,7 +721,8 @@ export interface FixedAsset {
 // Security, RBAC & Audit
 export type UserRoleType = 
   | 'مالك المؤسسة' 
-  | 'مدير النظام' 
+  | 'مدير النظام'
+  | 'Tenant Admin'
   | 'المدير المالي' 
   | 'محاسب' 
   | 'أمين الصندوق' 
@@ -749,6 +750,7 @@ export interface User {
   username: string;
   fullName: string;
   role: UserRoleType;
+  isSuperAdmin?: boolean;
   branchId: string;
   allowedCompanyIds?: string[];
   email: string;

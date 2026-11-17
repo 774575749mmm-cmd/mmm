@@ -39,8 +39,13 @@ import {
   encryptBackupPayload,
   decryptBackupPayload,
   filterDatabaseForUserTenants,
+  scopeDatabaseToCompany,
 } from '../../../services/storageService';
-import { validateUploadFile } from '../../../services/securityService';
+import {
+  getRoleDisplayLabel,
+  isTenantAdminUser,
+  validateUploadFile,
+} from '../../../services/securityService';
 import {
   BackupExportResult,
   BackupProgress,
@@ -100,8 +105,9 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
   onUpdateDatabase,
   onNotify,
 }) => {
-  const canManage = currentUser.canManageSettings;
+  const canManage = isTenantAdminUser(currentUser);
   const tenantScopedDb = useMemo(() => filterDatabaseForUserTenants(db, currentUser), [db, currentUser]);
+  const activeCompanyScopedDb = useMemo(() => scopeDatabaseToCompany(tenantScopedDb), [tenantScopedDb]);
 
   const [activeTab, setActiveTab] = useState<
     | 'company'
@@ -887,10 +893,10 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
             <h3 className="font-bold text-sm text-white flex items-center gap-2">
               <Building2 className="w-4 h-4 text-amber-400" />
-              <span>الفروع ({db.branches.length})</span>
+              <span>الفروع ({activeCompanyScopedDb.branches.length})</span>
             </h3>
             <div className="space-y-2 max-h-60 overflow-y-auto">
-              {db.branches.map((b) => (
+              {activeCompanyScopedDb.branches.map((b) => (
                 <div key={b.id} className="bg-slate-950 border border-slate-800 rounded-xl p-3">
                   <div className="flex justify-between font-bold text-slate-100">
                     <span>{b.nameAr}</span>
@@ -941,16 +947,16 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
 
           {/* Warehouses */}
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-5 space-y-4">
-            <h3 className="font-bold text-sm text-white">المستودعات ({db.warehouses.length})</h3>
+            <h3 className="font-bold text-sm text-white">المستودعات ({activeCompanyScopedDb.warehouses.length})</h3>
             <div className="space-y-2 max-h-60 overflow-y-auto">
-              {db.warehouses.map((w) => (
+              {activeCompanyScopedDb.warehouses.map((w) => (
                 <div key={w.id} className="bg-slate-950 border border-slate-800 rounded-xl p-3">
                   <div className="flex justify-between font-bold text-slate-100">
                     <span>{w.nameAr}</span>
                     <span className="font-mono text-amber-400">{w.code}</span>
                   </div>
                   <span className="text-[11px] text-slate-400 block mt-1">
-                    الأمين: {w.keeperName} · {db.branches.find((b) => b.id === w.branchId)?.nameAr || '-'}
+                    الأمين: {w.keeperName} · {activeCompanyScopedDb.branches.find((b) => b.id === w.branchId)?.nameAr || '-'}
                   </span>
                 </div>
               ))}
@@ -970,7 +976,7 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
                   onChange={(e) => setNewWhBranchId(e.target.value)}
                   className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5 text-white cursor-pointer"
                 >
-                  {db.branches.map((b) => (
+                  {activeCompanyScopedDb.branches.map((b) => (
                     <option key={b.id} value={b.id}>{b.nameAr}</option>
                   ))}
                 </select>
@@ -1339,7 +1345,7 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
                         <strong className="text-slate-200 block">{u.fullName}</strong>
                         <span className="text-[11px] font-mono text-slate-500 block">{u.email}</span>
                       </td>
-                      <td className="py-2.5 px-3 font-semibold text-amber-400">{u.role}</td>
+                      <td className="py-2.5 px-3 font-semibold text-amber-400">{getRoleDisplayLabel(u.role)}</td>
                       {(
                         [
                           'canViewReports',

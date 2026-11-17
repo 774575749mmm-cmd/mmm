@@ -19,6 +19,7 @@ import {
   Trash2,
   X,
   LayoutTemplate,
+  Landmark,
 } from 'lucide-react';
 import {
   Company,
@@ -52,10 +53,14 @@ import { GovernanceIntegrityPanel } from '../settings/GovernanceIntegrityPanel';
 import {
   buildUserRoleMatrix,
   generateSaltHex,
+  getRoleDisplayLabel,
   hashPasswordAsync,
+  isPlatformSuperAdmin,
+  isTenantAdminUser,
   validatePasswordStrength,
   validateUploadFile,
 } from '../../../services/securityService';
+import { cloudApiService } from '../../../services/cloudApiService';
 
 interface SettingsWorkbenchProps {
   db: ERPDatabase;
@@ -113,11 +118,25 @@ export const SettingsWorkbench: React.FC<SettingsWorkbenchProps> = ({
     | 'books'
     | 'rbac'
     | 'currencies'
-    | 'full_settings';
+    | 'full_settings'
+    | 'platform_subscriptions';
   const [subTab, setSubTab] = useState<SettingsSubTabId>('v20_customizer');
   const [templateEditorDirty, setTemplateEditorDirty] = useState(false);
   const [pendingSubTab, setPendingSubTab] = useState<SettingsSubTabId | null>(null);
   const [isBooksModalOpen, setIsBooksModalOpen] = useState(false);
+  const [platformCompanies, setPlatformCompanies] = useState<
+    Array<{
+      id: string;
+      nameAr: string;
+      countryCode: string;
+      baseCurrency: string;
+      status: string;
+      licenseStatus: string;
+      planCode: string;
+      createdAt: string;
+    }>
+  >([]);
+  const [platformLoading, setPlatformLoading] = useState(false);
 
   const requestSubTabSwitch = (nextTab: SettingsSubTabId) => {
     if (nextTab === subTab) return;
@@ -158,8 +177,22 @@ export const SettingsWorkbench: React.FC<SettingsWorkbenchProps> = ({
     : defaultTabsConfig;
 
   const scopedDb = React.useMemo(() => scopeDatabaseToCompany(db), [db]);
-  const canManage = currentUser.canManageSettings;
+  const isSuperAdmin = isPlatformSuperAdmin(currentUser);
+  const canManage = isTenantAdminUser(currentUser);
   const canEditRates = currentUser.canEditExchangeRates ?? canManage;
+
+  const loadPlatformOverview = async () => {
+    if (!isSuperAdmin) return;
+    setPlatformLoading(true);
+    try {
+      const ov = await cloudApiService.getAdminOverview();
+      setPlatformCompanies(ov.companies || []);
+    } catch (err: unknown) {
+      onNotify('error', err instanceof Error ? err.message : 'تعذر تحميل قائمة اشتراكات المنشآت.');
+    } finally {
+      setPlatformLoading(false);
+    }
+  };
 
   const updateUiPref = (patch: Partial<typeof uiPrefs>) => {
     if (!canManage) {
@@ -290,6 +323,23 @@ export const SettingsWorkbench: React.FC<SettingsWorkbenchProps> = ({
           <ShieldCheck className="w-3.5 h-3.5" />
           <span>{isEn ? '8. Integrity, Approvals & Closing' : '8. السلامة المالية، الموافقات والإقفال'}</span>
         </button>
+        {isSuperAdmin && (
+          <button
+            type="button"
+            onClick={() => {
+              requestSubTabSwitch('platform_subscriptions');
+              void loadPlatformOverview();
+            }}
+            className={`px-3 py-1.5 rounded-md text-xs font-black flex items-center gap-1.5 cursor-pointer ${
+              subTab === 'platform_subscriptions'
+                ? 'bg-[var(--gold)] text-[#03060A]'
+                : 'bg-[#08121E] border border-amber-500/40 text-amber-300'
+            }`}
+          >
+            <Landmark className="w-3.5 h-3.5" />
+            <span>{isEn ? '9. Platform Subscriptions (Super Admin)' : '9. إدارة المنشآت والاشتراكات (Super Admin)'}</span>
+          </button>
+        )}
       </div>
 
       {/* 1. V20 Theme, Typography, Tabs Visibility & Print Banner */}
@@ -562,6 +612,7 @@ export const SettingsWorkbench: React.FC<SettingsWorkbenchProps> = ({
                   <option value="مسؤول المشتريات">مسؤول المشتريات</option>
                   <option value="مسؤول المخزون">مسؤول المخزون</option>
                   <option value="المدير المالي">المدير المالي</option>
+                  <option value="Tenant Admin">مدير المنشأة (Tenant Admin)</option>
                   <option value="مستخدم محدود">مستخدم محدود</option>
                 </select>
                 <button
@@ -584,6 +635,7 @@ export const SettingsWorkbench: React.FC<SettingsWorkbenchProps> = ({
                     const salt = generateSaltHex(16);
                     const hash = await hashPasswordAsync(newPassword, salt);
                     const activeCoId = db.activeCompanyId || db.company.id;
+                    const isTenantAdminRole = newRole === 'Tenant Admin';
                     const newUser: User = {
                       id: `usr-${Date.now()}`,
                       username: cleanUsername,
@@ -598,32 +650,48 @@ export const SettingsWorkbench: React.FC<SettingsWorkbenchProps> = ({
                       mustChangePassword: true,
                       canViewReports: true,
                       canPostEntries: newRole !== 'مستخدم محدود' && newRole !== 'مسؤول المبيعات',
-                      canAdjustInventory: newRole === 'مسؤول المخزون' || newRole === 'المدير المالي',
-                      canViewCostsAndProfits: newRole === 'المدير المالي' || newRole === 'مسؤول المخزون',
-                      canManageSettings: false,
+                      canAdjustInventory: isTenantAdminRole || newRole === 'مسؤول المخزون' || newRole === 'المدير المالي',
+                      canViewCostsAndProfits: isTenantAdminRole || newRole === 'المدير المالي' || newRole === 'مسؤول المخزون',
+                      canManageSettings: isTenantAdminRole,
                       canEditInvoices: newRole !== 'مستخدم محدود',
-                      canDeleteInvoices: false,
+                      canDeleteInvoices: isTenantAdminRole,
                       canEditVouchers: newRole !== 'مستخدم محدود',
-                      canDeleteVouchers: false,
-                      canEditExchangeRates: false,
+                      canDeleteVouchers: isTenantAdminRole,
+                      canEditExchangeRates: isTenantAdminRole,
                       permissionMatrix: buildUserRoleMatrix(newRole),
                     };
-                    await fetch('/api/auth/users', {
-                      method: 'POST',
-                      credentials: 'include',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({
+                    try {
+                      await cloudApiService.saveCompanyUser({
                         id: newUser.id,
                         username: newUser.username,
                         fullName: newUser.fullName,
+                        email: newUser.email,
                         role: newUser.role,
                         allowedCompanyIds: newUser.allowedCompanyIds,
                         branchId: newUser.branchId,
                         active: newUser.active,
                         password: newPassword,
                         mustChangePassword: true,
-                      }),
-                    }).catch(() => null);
+                        flags: {
+                          canViewReports: newUser.canViewReports,
+                          canPostEntries: newUser.canPostEntries,
+                          canAdjustInventory: newUser.canAdjustInventory,
+                          canViewCostsAndProfits: newUser.canViewCostsAndProfits,
+                          canManageSettings: newUser.canManageSettings,
+                          canEditInvoices: newUser.canEditInvoices,
+                          canDeleteInvoices: newUser.canDeleteInvoices,
+                          canEditVouchers: newUser.canEditVouchers,
+                          canDeleteVouchers: newUser.canDeleteVouchers,
+                          canEditExchangeRates: newUser.canEditExchangeRates,
+                        },
+                        permissionMatrix: newUser.permissionMatrix,
+                      });
+                    } catch (err: unknown) {
+                      if (!(err instanceof TypeError)) {
+                        onNotify('error', err instanceof Error ? err.message : 'فشل حفظ المستخدم على الخادم.');
+                        return;
+                      }
+                    }
 
                     onAddUser(newUser);
                     setNewFullName('');
@@ -667,7 +735,7 @@ export const SettingsWorkbench: React.FC<SettingsWorkbenchProps> = ({
                         <div className="font-bold text-white">{u.fullName}</div>
                         <div className="text-[10px] font-mono text-slate-400">@{u.username}</div>
                       </td>
-                      <td className="p-2 text-slate-300">{u.role}</td>
+                      <td className="p-2 text-slate-300">{getRoleDisplayLabel(u.role, lang)}</td>
                       <td className="p-2 text-center">
                         <button
                           type="button"
@@ -764,14 +832,12 @@ export const SettingsWorkbench: React.FC<SettingsWorkbenchProps> = ({
                       mustChangePassword: true,
                     };
                   }
-                  await fetch('/api/auth/users', {
-                    method: 'POST',
-                    credentials: 'include',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
+                  try {
+                    await cloudApiService.saveCompanyUser({
                       id: nextUser.id,
                       username: nextUser.username,
                       fullName: nextUser.fullName,
+                      email: nextUser.email,
                       role: nextUser.role,
                       allowedCompanyIds: nextUser.allowedCompanyIds,
                       branchId: nextUser.branchId,
@@ -779,8 +845,26 @@ export const SettingsWorkbench: React.FC<SettingsWorkbenchProps> = ({
                       ...(editUserPassword.trim()
                         ? { password: editUserPassword.trim(), mustChangePassword: true }
                         : {}),
-                    }),
-                  }).catch(() => null);
+                      flags: {
+                        canViewReports: nextUser.canViewReports,
+                        canPostEntries: nextUser.canPostEntries,
+                        canAdjustInventory: nextUser.canAdjustInventory,
+                        canViewCostsAndProfits: nextUser.canViewCostsAndProfits,
+                        canManageSettings: nextUser.canManageSettings,
+                        canEditInvoices: nextUser.canEditInvoices,
+                        canDeleteInvoices: nextUser.canDeleteInvoices,
+                        canEditVouchers: nextUser.canEditVouchers,
+                        canDeleteVouchers: nextUser.canDeleteVouchers,
+                        canEditExchangeRates: nextUser.canEditExchangeRates,
+                      },
+                      permissionMatrix: nextUser.permissionMatrix,
+                    });
+                  } catch (err: unknown) {
+                    if (!(err instanceof TypeError)) {
+                      onNotify('error', err instanceof Error ? err.message : 'فشل تحديث المستخدم على الخادم.');
+                      return;
+                    }
+                  }
 
                   onUpdateUserPermissions(nextUser);
                   setEditingUser(null);
@@ -835,6 +919,7 @@ export const SettingsWorkbench: React.FC<SettingsWorkbenchProps> = ({
                       <option value="مسؤول المشتريات">مسؤول المشتريات</option>
                       <option value="مسؤول المخزون">مسؤول المخزون</option>
                       <option value="المدير المالي">المدير المالي</option>
+                      <option value="Tenant Admin">مدير المنشأة (Tenant Admin)</option>
                       <option value="مستخدم محدود">مستخدم محدود</option>
                     </select>
                   </div>
@@ -1134,6 +1219,103 @@ export const SettingsWorkbench: React.FC<SettingsWorkbenchProps> = ({
           onUpdateDatabase={onUpdateDatabase || onRestoreDatabase}
           onNotify={onNotify}
         />
+      )}
+
+      {/* 9. Platform Subscriptions Management (Strictly Super Admin Only) */}
+      {subTab === 'platform_subscriptions' && isSuperAdmin && (
+        <div className="v20-card p-4 space-y-3 text-xs">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-b border-[var(--border-strong)] pb-2.5">
+            <div>
+              <h3 className="font-black text-sm text-[var(--gold)]">
+                إدارة المنشآت وحالة الاشتراكات (مالك المنصة المركزي - Super Admin)
+              </h3>
+              <p className="text-[11px] text-slate-400">
+                تفعيل أو إيقاف اشتراكات المنشآت في قاعدة بيانات PostgreSQL
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => void loadPlatformOverview()}
+              className="px-3 py-1.5 rounded bg-[#08121E] border border-[var(--border-strong)] hover:border-[var(--gold)] text-white font-bold cursor-pointer"
+            >
+              {platformLoading ? 'جاري التحديث...' : 'تحديث القائمة'}
+            </button>
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-right text-xs border-collapse">
+              <thead className="bg-[#0B192C] text-[var(--gold)] border-b-2 border-[var(--gold)]">
+                <tr>
+                  <th className="p-2">المنشأة</th>
+                  <th className="p-2">الدولة / العملة</th>
+                  <th className="p-2 text-center">حالة المنشأة</th>
+                  <th className="p-2 text-center">الإجراء</th>
+                </tr>
+              </thead>
+              <tbody>
+                {platformCompanies.map((comp) => {
+                  const isActiveComp = comp.status === 'active';
+                  return (
+                    <tr key={comp.id} className="border-b border-[#1B2E44]">
+                      <td className="p-2">
+                        <div className="font-bold text-white">{comp.nameAr}</div>
+                        <div className="text-[10px] font-mono text-slate-400">{comp.id}</div>
+                      </td>
+                      <td className="p-2 font-mono text-slate-300">
+                        {comp.countryCode} · {comp.baseCurrency}
+                      </td>
+                      <td className="p-2 text-center">
+                        <span
+                          className={`px-2 py-0.5 rounded text-[10px] font-black border ${
+                            isActiveComp
+                              ? 'bg-emerald-950/60 border-emerald-500/50 text-emerald-300'
+                              : 'bg-rose-950/60 border-rose-500/50 text-rose-300'
+                          }`}
+                        >
+                          {isActiveComp ? 'نشطة (Active)' : `موقوفة (${comp.status})`}
+                        </span>
+                      </td>
+                      <td className="p-2 text-center">
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            const nextStatus = isActiveComp ? 'suspended' : 'active';
+                            try {
+                              await cloudApiService.updateCompanyStatus(comp.id, nextStatus);
+                              onNotify(
+                                'success',
+                                `تم تحديث حالة اشتراك (${comp.nameAr}) إلى ${nextStatus}.`
+                              );
+                              await loadPlatformOverview();
+                            } catch (err: unknown) {
+                              onNotify(
+                                'error',
+                                err instanceof Error ? err.message : 'تعذر تغيير حالة الاشتراك.'
+                              );
+                            }
+                          }}
+                          className={`px-3 py-1 rounded text-[11px] font-black cursor-pointer ${
+                            isActiveComp
+                              ? 'bg-rose-900/60 hover:bg-rose-800 text-rose-200 border border-rose-500/40'
+                              : 'bg-emerald-900/60 hover:bg-emerald-800 text-emerald-200 border border-emerald-500/40'
+                          }`}
+                        >
+                          {isActiveComp ? 'إيقاف الاشتراك' : 'تفعيل الاشتراك'}
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
+                {platformCompanies.length === 0 && (
+                  <tr>
+                    <td colSpan={4} className="p-4 text-center text-slate-400">
+                      {platformLoading ? 'جاري تحميل بيانات المنشآت...' : 'لا توجد منشآت مسجلة في الخادم السحابي.'}
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
       )}
 
       <DocumentBooksModal

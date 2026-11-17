@@ -31,18 +31,23 @@ import {
   applyCountryPackToCompanyAndSettings,
 } from '../../../services/countryComplianceService';
 import {
-  assertPermission,
   buildUserRoleMatrix,
   generateSaltHex,
   hashPasswordAsync,
+  isPlatformSuperAdmin,
   validatePasswordStrength,
   sanitizeInputText,
 } from '../../../services/securityService';
+import {
+  cloudApiService,
+  serverCompanyToErpCompany,
+} from '../../../services/cloudApiService';
 
 interface SetupWizardModalProps {
   isOpen: boolean;
   db: ERPDatabase;
   currentUser?: User;
+  cloudSessionActive?: boolean;
   onClose: () => void;
   onCreateCompany: (nextDb: ERPDatabase, newCompany: Company) => void;
   onNotify: (type: 'success' | 'error' | 'info', msg: string) => void;
@@ -52,6 +57,7 @@ export const SetupWizardModal: React.FC<SetupWizardModalProps> = ({
   isOpen,
   db,
   currentUser,
+  cloudSessionActive = false,
   onClose,
   onCreateCompany,
   onNotify,
@@ -66,6 +72,7 @@ export const SetupWizardModal: React.FC<SetupWizardModalProps> = ({
   const [commercialRecord, setCommercialRecord] = useState('');
   const [adminPassword, setAdminPassword] = useState('');
   const [valuationPolicy, setValuationPolicy] = useState<Company['valuationPolicy']>('PER_ITEM');
+  const [isSaving, setIsSaving] = useState(false);
 
   if (!isOpen) return null;
 
@@ -75,9 +82,8 @@ export const SetupWizardModal: React.FC<SetupWizardModalProps> = ({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const actor = currentUser || db.users[0];
-    const perm = assertPermission(actor, 'settings', 'create');
-    if (!perm.ok) {
-      onNotify('error', perm.error || 'عذراً، لا تملك صلاحية تأسيس منشأة جديدة.');
+    if (!isPlatformSuperAdmin(actor)) {
+      onNotify('error', 'صلاحية مرفوضة: تأسيس منشآت متعددة متاح فقط لمالك المنصة الرئيسي (Super Admin).');
       return;
     }
 
@@ -283,11 +289,123 @@ export const SetupWizardModal: React.FC<SetupWizardModalProps> = ({
       );
     }
 
+    const isolatedNewCompanyState: Record<string, unknown> = {
+      schemaVersion: CURRENT_SCHEMA_VERSION,
+      company: applied.company,
+      activeCompanyId: companyId,
+      currencies: applied.currencies,
+      branches: [
+        {
+          id: branchId,
+          companyId,
+          code: `BR-${db.branches.length + 1}`,
+          nameAr: sanitizeInputText(branchName) || 'الفرع الرئيسي',
+          phone: baseCompany.phone,
+          address: baseCompany.address,
+          managerName: 'مدير الفرع',
+          isMain: true,
+          status: 'active' as const,
+        },
+      ],
+      warehouses: [
+        {
+          id: warehouseId,
+          companyId,
+          branchId,
+          code: `WH-${db.warehouses.length + 1}`,
+          nameAr: sanitizeInputText(warehouseName) || 'المستودع المركزي',
+          location: baseCompany.address,
+          keeperName: 'أمين المستودع',
+          status: 'active' as const,
+        },
+      ],
+      chartOfAccounts: companyCoa,
+      treasuryAccounts: [starterTreasury],
+      costCenters: companyCostCenters,
+      expenseCategories: companyExpenseCategories,
+      documentBooks: companyDocBooks,
+      fiscalPeriods: [
+        {
+          id: `fp-${companyId}-${fiscalYear}`,
+          companyId,
+          fiscalYear,
+          periodName: `السنة المالية ${fiscalYear} (${cleanName})`,
+          startDate: `${fiscalYear}-01-01`,
+          endDate: `${fiscalYear}-12-31`,
+          status: 'open' as const,
+        },
+      ],
+      customers: [],
+      vendors: [],
+      inventoryItems: [],
+      warehouseStock: [],
+      stockCostLayers: [],
+      inventoryBatches: [],
+      storageLocations: [],
+      stockMovements: [],
+      inventoryTransfers: [],
+      stocktakings: [],
+      warehouseDocuments: [],
+      journalEntries: [],
+      invoices: [],
+      commercialOrders: [],
+      paymentVouchers: [],
+      treasuryTransfers: [],
+      bankReconciliations: [],
+      posShifts: [],
+      heldPosCarts: [],
+      expenseRecords: [],
+      employees: [],
+      payrollRuns: [],
+      fixedAssets: [],
+      customBooks: [],
+      customBookEntries: [],
+      approvalRequests: [],
+      fxRevaluations: [],
+      taskAlerts: [],
+      dispatchLogs: [],
+      settings: applied.settings,
+    };
+
+    setIsSaving(true);
+    let serverCompaniesList: Company[] | null = null;
+    let serverRevision = 1;
+
+    try {
+      const serverCreated = await cloudApiService.createCompany({
+        id: companyId,
+        nameAr: applied.company.nameAr,
+        nameEn: applied.company.nameEn,
+        countryCode,
+        baseCurrency: applied.company.baseCurrency,
+        valuationPolicy: applied.company.valuationPolicy,
+        commercialRecord: applied.company.commercialRecord,
+        taxNumber: applied.company.taxNumber,
+        phone: applied.company.phone,
+        email: applied.company.email,
+        address: applied.company.address,
+        fiscalYearStart: applied.company.fiscalYearStart,
+        branchName: sanitizeInputText(branchName) || 'الفرع الرئيسي',
+        warehouseName: sanitizeInputText(warehouseName) || 'المستودع المركزي',
+        initialState: isolatedNewCompanyState,
+      });
+      serverCompaniesList = (serverCreated.companies || []).map(serverCompanyToErpCompany);
+      serverRevision = serverCreated.revision || 1;
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'فشل حفظ المنشأة في قاعدة البيانات.';
+      if (cloudSessionActive || !(err instanceof TypeError)) {
+        setIsSaving(false);
+        onNotify('error', msg);
+        return;
+      }
+    }
+
     const nextDb: ERPDatabase = {
       ...db,
       schemaVersion: CURRENT_SCHEMA_VERSION,
+      revision: serverRevision,
       company: applied.company,
-      companies: nextCompanies,
+      companies: serverCompaniesList && serverCompaniesList.length > 0 ? serverCompaniesList : nextCompanies,
       activeCompanyId: companyId,
       currencies: applied.currencies,
       branches: nextBranches,
@@ -316,8 +434,9 @@ export const SetupWizardModal: React.FC<SetupWizardModalProps> = ({
       ],
     };
 
+    setIsSaving(false);
     onCreateCompany(nextDb, applied.company);
-    onNotify('success', `تم إنشاء وتفعيل منشأة "${cleanName}" بحزمة (${selectedPack.nameAr}).`);
+    onNotify('success', `تم إنشاء وحفظ منشأة "${cleanName}" في قاعدة البيانات وتفعيلها.`);
     onClose();
   };
 
@@ -466,10 +585,11 @@ export const SetupWizardModal: React.FC<SetupWizardModalProps> = ({
           </button>
           <button
             type="submit"
-            className="px-5 py-2 rounded-lg v20-btn-gold font-black flex items-center gap-1.5 cursor-pointer"
+            disabled={isSaving}
+            className="px-5 py-2 rounded-lg v20-btn-gold font-black flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
           >
             <CheckCircle2 className="w-4 h-4" />
-            <span>تأسيس وتفعيل المنشأة</span>
+            <span>{isSaving ? 'جاري الحفظ في PostgreSQL...' : 'تأسيس وتفعيل المنشأة'}</span>
           </button>
         </div>
       </form>

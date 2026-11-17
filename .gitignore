@@ -7,4 +7,6 @@ coverage/
 .env*
 !.env.example
 .erp-auth-users.json
+.erp-pglite-data/
+
 
