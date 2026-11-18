@@ -2324,9 +2324,12 @@ export default function App() {
         canCancel={authCanCancel}
         lang={lang}
         onBootstrapComplete={async (updatedOwner) => {
+          const hasOwner = db.users.some((u) => u.id === updatedOwner.id);
           const seedDb: ERPDatabase = {
             ...db,
-            users: db.users.map((u) => (u.id === updatedOwner.id ? updatedOwner : u)),
+            users: hasOwner
+              ? db.users.map((u) => (u.id === updatedOwner.id ? updatedOwner : u))
+              : [updatedOwner, ...db.users],
           };
           setDb(seedDb);
           try {

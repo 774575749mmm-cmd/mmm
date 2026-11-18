@@ -8,7 +8,7 @@ import 'dotenv/config';
 import fs from 'node:fs';
 import path from 'node:path';
 import express, { type Request, type Response } from 'express';
-import { createErpServerApp } from './server/app.ts';
+import { createErpServerApp, ensureInitialOwnerFromEnv } from './server/app.ts';
 import { createServerDatabaseFromEnv } from './server/db.ts';
 
 const PORT = Number(process.env.PORT || 3000);
@@ -16,6 +16,14 @@ const isProduction = process.env.NODE_ENV === 'production';
 
 async function startServer(): Promise<void> {
   const db = await createServerDatabaseFromEnv();
+  const bootStatus = await ensureInitialOwnerFromEnv(db);
+  if (bootStatus.bootstrapped) {
+    console.log(`[ERP Auth] Initial owner account bootstrapped from environment (${bootStatus.username}).`);
+  } else if (bootStatus.reason === 'env_password_not_configured') {
+    console.warn(
+      '[ERP Auth] Database has no users yet (authInitialized=false). Set ERP_BOOTSTRAP_ADMIN_PASSWORD or activate via /api/auth/bootstrap.'
+    );
+  }
   const app = createErpServerApp({ isProduction, db });
 
   if (!isProduction) {

@@ -10,7 +10,7 @@ import {
   type PgExecutor,
 } from '../server/db';
 import { TENANT_RLS_TABLES } from '../migrations/001_multi_tenant_core';
-import { createErpServerApp } from '../server/app';
+import { createErpServerApp, ensureInitialOwnerFromEnv } from '../server/app';
 import {
   hydrateErpDatabaseFromServerState,
   extractScopedCloudStatePayload,
@@ -54,7 +54,7 @@ describe('Phase 1 Cloud Multi-Tenant PostgreSQL, RLS, Tenant Admin & Company Per
 
   beforeEach(async () => {
     db = await createTestPgDb();
-  });
+  }, 30_000);
 
   afterEach(async () => {
     if (srv) {
@@ -702,6 +702,121 @@ describe('Phase 1 Cloud Multi-Tenant PostgreSQL, RLS, Tenant Admin & Company Per
         else process.env.ERP_PGLITE_DIR = prevDir;
         if (prevEnv === undefined) delete process.env.NODE_ENV;
         else process.env.NODE_ENV = prevEnv;
+      }
+    });
+  });
+
+  describe('5. Staging Auth Initialization, Env Bootstrap & Restricted RLS Role', () => {
+    it('reproduces authInitialized:false on fresh Staging DB, initializes securely via ERP_BOOTSTRAP_ADMIN_PASSWORD without SUPERUSER/BYPASSRLS, preserves existing DBs, and sets Secure cookie behind HTTPS proxy', async () => {
+      const prevNodeEnv = process.env.NODE_ENV;
+      process.env.NODE_ENV = 'staging';
+      try {
+        srv = await startPgTestServer(db!);
+
+        // 1. Fresh Staging DB after migrations has RLS active & restricted app role, 0 users -> authInitialized: false
+        const healthBeforeResp = await fetch(`${srv.baseUrl}/api/health`);
+        expect(healthBeforeResp.status).toBe(200);
+        const healthBefore = await healthBeforeResp.json();
+        expect(healthBefore.ok).toBe(true);
+        expect(healthBefore.rlsReady).toBe(true);
+        expect(healthBefore.rlsRoleRestricted).toBe(true);
+        expect(healthBefore.authInitialized).toBe(false);
+
+        const statusBeforeResp = await fetch(`${srv.baseUrl}/api/auth/status`);
+        expect(statusBeforeResp.status).toBe(200);
+        const statusBefore = await statusBeforeResp.json();
+        expect(statusBefore.initialized).toBe(false);
+        expect(statusBefore.authenticated).toBe(false);
+
+        // 2. Without ERP_BOOTSTRAP_ADMIN_PASSWORD, ensureInitialOwnerFromEnv MUST NOT seed dummy/hardcoded users
+        const noEnvRes = await ensureInitialOwnerFromEnv(db!, { NODE_ENV: 'staging' });
+        expect(noEnvRes).toEqual({ bootstrapped: false, reason: 'env_password_not_configured' });
+
+        // 3. Weak env password MUST fail policy validation
+        await expect(
+          ensureInitialOwnerFromEnv(db!, {
+            NODE_ENV: 'staging',
+            ERP_BOOTSTRAP_ADMIN_PASSWORD: 'weak',
+          })
+        ).rejects.toThrow(/password strength policy/i);
+
+        // 4. Valid env password initializes Staging owner with PBKDF2-SHA256 & restricted RLS role
+        const strongStagingPass = 'StgAdmin#2026!Secure';
+        const initRes = await ensureInitialOwnerFromEnv(db!, {
+          NODE_ENV: 'staging',
+          ERP_BOOTSTRAP_ADMIN_USERNAME: 'stg_owner',
+          ERP_BOOTSTRAP_ADMIN_PASSWORD: strongStagingPass,
+          ERP_BOOTSTRAP_ADMIN_NAME: 'مدير بيئة Staging',
+          ERP_BOOTSTRAP_COMPANY_NAME: 'شركة المنصور Staging',
+        });
+        expect(initRes.bootstrapped).toBe(true);
+        expect(initRes.username).toBe('stg_owner');
+
+        // Confirm restricted erp_app_role NEVER received SUPERUSER or BYPASSRLS
+        const roleCheck = await db!.query<{ rolsuper: boolean; rolbypassrls: boolean }>(
+          "SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = 'erp_app_role'"
+        );
+        expect(roleCheck.rows[0]).toEqual({ rolsuper: false, rolbypassrls: false });
+
+        // 5. Health and auth status now report authInitialized: true / initialized: true
+        const healthAfterResp = await fetch(`${srv.baseUrl}/api/health`);
+        expect(healthAfterResp.status).toBe(200);
+        const healthAfter = await healthAfterResp.json();
+        expect(healthAfter.rlsReady).toBe(true);
+        expect(healthAfter.rlsRoleRestricted).toBe(true);
+        expect(healthAfter.authInitialized).toBe(true);
+
+        const statusAfterInitResp = await fetch(`${srv.baseUrl}/api/auth/status`);
+        expect(statusAfterInitResp.status).toBe(200);
+        const statusAfterInit = await statusAfterInitResp.json();
+        expect(statusAfterInit.initialized).toBe(true);
+        expect(statusAfterInit.authenticated).toBe(false);
+
+        // 6. Idempotency / Production protection: re-running ensureInitialOwnerFromEnv NEVER overwrites existing users
+        const rerunRes = await ensureInitialOwnerFromEnv(db!, {
+          NODE_ENV: 'staging',
+          ERP_BOOTSTRAP_ADMIN_USERNAME: 'other_admin',
+          ERP_BOOTSTRAP_ADMIN_PASSWORD: 'Another#Strong2026!Pass',
+        });
+        expect(rerunRes).toEqual({ bootstrapped: false, reason: 'already_initialized' });
+
+        // 7. Login behind simulated multi-hop HTTPS reverse proxy sets HttpOnly + SameSite=Lax + Secure cookie
+        const loginResp = await fetch(`${srv.baseUrl}/api/auth/login`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'X-Forwarded-Proto': 'https, http',
+          },
+          body: JSON.stringify({
+            username: 'stg_owner',
+            password: strongStagingPass,
+          }),
+        });
+        expect(loginResp.status).toBe(200);
+        const rawSetCookie = loginResp.headers.get('set-cookie') || '';
+        expect(rawSetCookie).toContain('HttpOnly');
+        expect(rawSetCookie).toContain('SameSite=Lax');
+        expect(rawSetCookie).toContain('Secure');
+
+        const cookie = extractSessionCookie(loginResp);
+        const verifyResp = await fetch(`${srv.baseUrl}/api/auth/verify`, {
+          headers: { Cookie: cookie },
+        });
+        expect(verifyResp.status).toBe(200);
+        const verifyJson = await verifyResp.json();
+        expect(verifyJson.ok).toBe(true);
+        expect(verifyJson.user.username).toBe('stg_owner');
+
+        const statusAuthResp = await fetch(`${srv.baseUrl}/api/auth/status`, {
+          headers: { Cookie: cookie },
+        });
+        expect(statusAuthResp.status).toBe(200);
+        const statusAuth = await statusAuthResp.json();
+        expect(statusAuth.initialized).toBe(true);
+        expect(statusAuth.authenticated).toBe(true);
+      } finally {
+        if (prevNodeEnv === undefined) delete process.env.NODE_ENV;
+        else process.env.NODE_ENV = prevNodeEnv;
       }
     });
   });

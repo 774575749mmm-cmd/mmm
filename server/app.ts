@@ -167,8 +167,9 @@ function parseCookies(cookieHeader: string | undefined): Record<string, string> 
 
 function isRequestHttps(req: Request): boolean {
   if (req.secure) return true;
-  const proto = String(req.headers['x-forwarded-proto'] || '').toLowerCase();
-  return proto === 'https';
+  const rawProto = String(req.headers['x-forwarded-proto'] || '').toLowerCase();
+  const firstHopProto = rawProto.split(',')[0]?.trim();
+  return firstHopProto === 'https';
 }
 
 function setSessionCookie(req: Request, res: Response, token: string, isProduction: boolean): void {
@@ -392,6 +393,86 @@ function getGeminiClient(): GoogleGenAI | null {
   });
 }
 
+export async function ensureInitialOwnerFromEnv(
+  db: PgExecutor,
+  env: Record<string, string | undefined> = process.env
+): Promise<{ bootstrapped: boolean; reason: string; username?: string }> {
+  const repo = new PgTenantRepository(db);
+  if (await repo.hasAnyUsers()) {
+    return { bootstrapped: false, reason: 'already_initialized' };
+  }
+
+  const password = String(env.ERP_BOOTSTRAP_ADMIN_PASSWORD || '').trim();
+  if (!password) {
+    return { bootstrapped: false, reason: 'env_password_not_configured' };
+  }
+
+  const strength = validatePasswordStrengthServer(password);
+  if (!strength.ok) {
+    throw new Error(
+      `CRITICAL AUTH CONFIG ERROR: ERP_BOOTSTRAP_ADMIN_PASSWORD does not meet password strength policy: ${strength.error || 'weak password'}`
+    );
+  }
+
+  const username = String(env.ERP_BOOTSTRAP_ADMIN_USERNAME || 'admin').trim() || 'admin';
+  const fullName = String(env.ERP_BOOTSTRAP_ADMIN_NAME || 'مالك المؤسسة').trim() || 'مالك المؤسسة';
+  const companyId = String(env.ERP_BOOTSTRAP_COMPANY_ID || 'comp-01').trim() || 'comp-01';
+  const companyNameAr =
+    String(env.ERP_BOOTSTRAP_COMPANY_NAME || 'مؤسسة المنصور للتجارة والاستثمار').trim() ||
+    'مؤسسة المنصور للتجارة والاستثمار';
+  const countryCode = String(env.ERP_BOOTSTRAP_COUNTRY_CODE || 'YE').trim() || 'YE';
+  const baseCurrency = String(env.ERP_BOOTSTRAP_BASE_CURRENCY || 'YER').trim() || 'YER';
+
+  const { hash, salt } = hashPasswordPbkdf2Server(password);
+  const ownerRecord: ServerUserRecord = {
+    id: 'usr-01',
+    username,
+    fullName,
+    email: String(env.ERP_BOOTSTRAP_ADMIN_EMAIL || `${username}@almansoor.erp`).trim(),
+    role: 'مالك المؤسسة',
+    isSuperAdmin: true,
+    allowedCompanyIds: [companyId],
+    branchId: 'br-01',
+    active: true,
+    passwordHash: hash,
+    passwordSalt: salt,
+    mustChangePassword: false,
+    companyId,
+    lastActiveCompanyId: companyId,
+    flags: {
+      canViewReports: true,
+      canPostEntries: true,
+      canAdjustInventory: true,
+      canViewCostsAndProfits: true,
+      canManageSettings: true,
+      canEditInvoices: true,
+      canDeleteInvoices: true,
+      canEditVouchers: true,
+      canDeleteVouchers: true,
+      canEditExchangeRates: true,
+    },
+    updatedAt: new Date().toISOString(),
+  };
+
+  const res = await repo.bootstrapOwner({
+    user: ownerRecord,
+    companies: [
+      {
+        id: companyId,
+        nameAr: companyNameAr,
+        nameEn: companyNameAr,
+        countryCode,
+        baseCurrency,
+      },
+    ],
+  });
+
+  if (!res.ok) {
+    return { bootstrapped: false, reason: res.code.toLowerCase() };
+  }
+  return { bootstrapped: true, reason: 'bootstrapped_from_env', username };
+}
+
 export function createErpServerApp(options: ServerAppOptions = {}): Express {
   const isProduction = options.isProduction ?? process.env.NODE_ENV === 'production';
   const sessionSecret = resolveSessionSecret({
@@ -559,6 +640,7 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
   };
 
   const app = express();
+  app.set('trust proxy', 1);
   app.use(express.json({ limit: '16mb' }));
 
   // Baseline HTTP Security Headers (OWASP ASVS alignment)
