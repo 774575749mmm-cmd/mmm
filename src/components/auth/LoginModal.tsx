@@ -77,7 +77,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({
     setIsRegisterMode(false);
     if (mode === 'bootstrap') {
       const owner = users.find((u) => u.role === 'مالك المؤسسة') || users[0];
-      if (owner) setUsername(owner.username);
+      setUsername(owner?.username?.trim() || 'admin');
     }
   }, [isOpen, mode, users]);
 

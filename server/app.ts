@@ -166,10 +166,11 @@ function parseCookies(cookieHeader: string | undefined): Record<string, string> 
 }
 
 function isRequestHttps(req: Request): boolean {
-  if (req.secure) return true;
-  const rawProto = String(req.headers['x-forwarded-proto'] || '').toLowerCase();
-  const firstHopProto = rawProto.split(',')[0]?.trim();
-  return firstHopProto === 'https';
+  const rawProto = Array.isArray(req.headers['x-forwarded-proto'])
+    ? req.headers['x-forwarded-proto'].join(',')
+    : String(req.headers['x-forwarded-proto'] || '');
+  const firstHopProto = rawProto.toLowerCase().split(',')[0]?.trim();
+  return Boolean(req.secure) || firstHopProto === 'https';
 }
 
 function setSessionCookie(req: Request, res: Response, token: string, isProduction: boolean): void {
