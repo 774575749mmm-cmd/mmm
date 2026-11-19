@@ -43,6 +43,7 @@ import {
 } from '../../../services/storageService';
 import {
   getRoleDisplayLabel,
+  isPlatformSuperAdmin,
   isTenantAdminUser,
   validateUploadFile,
 } from '../../../services/securityService';
@@ -66,7 +67,14 @@ interface SettingsModuleProps {
   onUpdateCurrencies: (currencies: Currency[]) => void;
   onUpdateUserPermissions?: (user: User) => void;
   onResetDatabase: () => void;
-  onRestoreDatabase: (db: ERPDatabase) => void;
+  onRestoreDatabase: (
+    db: ERPDatabase,
+    options?: {
+      targetMode?: 'current_company' | 'restored_company';
+      allowReplaceExisting?: boolean;
+      sourceLabel?: string;
+    }
+  ) => Promise<{ ok: boolean; error?: string; code?: string; status?: number } | void> | void;
   onUpdateDatabase?: (db: ERPDatabase) => void;
   onNotify?: (type: 'success' | 'error' | 'info', msg: string) => void;
 }
@@ -106,6 +114,7 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
   onNotify,
 }) => {
   const canManage = isTenantAdminUser(currentUser);
+  const isSuperAdmin = isPlatformSuperAdmin(currentUser);
   const tenantScopedDb = useMemo(() => filterDatabaseForUserTenants(db, currentUser), [db, currentUser]);
   const activeCompanyScopedDb = useMemo(() => scopeDatabaseToCompany(tenantScopedDb), [tenantScopedDb]);
 
@@ -205,6 +214,11 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
     fileName: string;
     stats: NonNullable<ReturnType<typeof validateBackupPayload>['stats']>;
   } | null>(null);
+  const [restoreTargetMode, setRestoreTargetMode] = useState<'current_company' | 'restored_company'>('current_company');
+  const [allowReplaceExisting, setAllowReplaceExisting] = useState(false);
+  const [isCommittingRestore, setIsCommittingRestore] = useState(false);
+  const [restoreErrorMsg, setRestoreErrorMsg] = useState('');
+  const [restoreErrorCode, setRestoreErrorCode] = useState('');
   const [isResetModalOpen, setIsResetModalOpen] = useState(false);
 
   const requireAdmin = () => {
@@ -381,6 +395,15 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
         onNotify?.('error', check.error || 'ملف النسخة الاحتياطية غير صالح.');
         return;
       }
+      const activeCid = db.activeCompanyId || db.company.id;
+      setRestoreTargetMode(
+        isSuperAdmin && check.db.company.id && check.db.company.id !== activeCid
+          ? 'restored_company'
+          : 'current_company'
+      );
+      setAllowReplaceExisting(false);
+      setRestoreErrorMsg('');
+      setRestoreErrorCode('');
       setPendingRestore({ db: check.db, fileName: file.name, stats: check.stats });
     } finally {
       setIsParsingRestore(false);
@@ -398,8 +421,17 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
         return;
       }
       const fileName = pendingEncryptedRaw.fileName;
+      const activeCid = db.activeCompanyId || db.company.id;
       setPendingEncryptedRaw(null);
       setDecryptPassphrase('');
+      setRestoreTargetMode(
+        isSuperAdmin && check.db.company.id && check.db.company.id !== activeCid
+          ? 'restored_company'
+          : 'current_company'
+      );
+      setAllowReplaceExisting(false);
+      setRestoreErrorMsg('');
+      setRestoreErrorCode('');
       setPendingRestore({ db: check.db, fileName, stats: check.stats });
     } catch {
       onNotify?.('error', 'كلمة مرور فك التشفير غير صحيحة أو الملف تالف.');
@@ -1619,10 +1651,23 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
         <div className="max-w-5xl">
           <DataMigrationPanel
             db={db}
-            onApplyMigration={(updated) => {
-              if (!requireAdmin()) return;
-              onRestoreDatabase(updated);
-              onNotify?.('success', 'تم تطبيق وترحيل البيانات المستوردة بنجاح.');
+            currentUser={currentUser}
+            onApplyMigration={async (updated, migrationOptions) => {
+              if (!requireAdmin()) {
+                return {
+                  ok: false,
+                  status: 403,
+                  error: 'عذراً، صلاحيات حسابك الحالي لا تسمح بتعديل إعدادات النظام.',
+                };
+              }
+              const res = await onRestoreDatabase(updated, migrationOptions);
+              if (res && !res.ok) {
+                return res;
+              }
+              if (!res) {
+                onNotify?.('success', 'تم تطبيق وترحيل البيانات المستوردة بنجاح.');
+              }
+              return res;
             }}
           />
         </div>
@@ -1633,21 +1678,113 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
         isOpen={Boolean(pendingRestore)}
         title="تأكيد استعادة النسخة الاحتياطية"
         variant="warning"
+        isLoading={isCommittingRestore}
         message={
           pendingRestore
-            ? `تم التحقق من سلامة الملف (${pendingRestore.fileName}): يحتوي على ${pendingRestore.stats.accounts} حساب، ${pendingRestore.stats.invoices} فاتورة، ${pendingRestore.stats.vouchers} سند، ${pendingRestore.stats.customers} عميل، ${pendingRestore.stats.items} صنف، ${pendingRestore.stats.journalEntries} قيد يومية. هل تريد استبدال قاعدة البيانات الحالية بهذه النسخة؟`
+            ? `تم التحقق من سلامة الملف (${pendingRestore.fileName}): يحتوي على ${pendingRestore.stats.accounts} حساب، ${pendingRestore.stats.invoices} فاتورة، ${pendingRestore.stats.vouchers} سند، ${pendingRestore.stats.customers} عميل، ${pendingRestore.stats.items} صنف، ${pendingRestore.stats.journalEntries} قيد يومية.`
             : ''
         }
         confirmLabel="اعتماد الاستعادة الآن"
-        onConfirm={() => {
-          if (pendingRestore) {
-            onRestoreDatabase(pendingRestore.db);
-            onNotify?.('success', 'تمت استعادة قاعدة البيانات بنجاح.');
+        onConfirm={async () => {
+          if (!pendingRestore || isCommittingRestore) return;
+          setIsCommittingRestore(true);
+          setRestoreErrorMsg('');
+          try {
+            const res = await onRestoreDatabase(pendingRestore.db, {
+              targetMode: restoreTargetMode,
+              allowReplaceExisting,
+              sourceLabel: pendingRestore.fileName,
+            });
+            if (res && !res.ok) {
+              setRestoreErrorMsg(res.error || 'تعذر اعتماد الاستعادة في قاعدة البيانات.');
+              setRestoreErrorCode(res.code || '');
+              return;
+            }
+            if (!res) {
+              onNotify?.('success', 'تمت استعادة قاعدة البيانات بنجاح.');
+            }
+            setPendingRestore(null);
+            setAllowReplaceExisting(false);
+            setRestoreErrorMsg('');
+            setRestoreErrorCode('');
+          } finally {
+            setIsCommittingRestore(false);
           }
-          setPendingRestore(null);
         }}
-        onCancel={() => setPendingRestore(null)}
-      />
+        onCancel={() => {
+          setPendingRestore(null);
+          setAllowReplaceExisting(false);
+          setRestoreErrorMsg('');
+          setRestoreErrorCode('');
+        }}
+      >
+        {pendingRestore && (
+          <div className="space-y-2.5 text-xs">
+            {isSuperAdmin ? (
+              <div className="bg-slate-950 border border-slate-800 rounded-lg p-3 space-y-2">
+                <div className="font-bold text-amber-300">نطاق الاستعادة والربط في قاعدة البيانات:</div>
+                <label className="flex items-start gap-2 cursor-pointer text-slate-200">
+                  <input
+                    type="radio"
+                    name="backupRestoreMode"
+                    checked={restoreTargetMode === 'current_company'}
+                    onChange={() => {
+                      setRestoreTargetMode('current_company');
+                      setAllowReplaceExisting(false);
+                      setRestoreErrorMsg('');
+                      setRestoreErrorCode('');
+                    }}
+                    className="mt-0.5 accent-amber-500"
+                  />
+                  <span>
+                    الاستعادة داخل المنشأة النشطة الحالية (<strong>{db.company.nameAr}</strong>)
+                  </span>
+                </label>
+                <label className="flex items-start gap-2 cursor-pointer text-slate-200">
+                  <input
+                    type="radio"
+                    name="backupRestoreMode"
+                    checked={restoreTargetMode === 'restored_company'}
+                    onChange={() => {
+                      setRestoreTargetMode('restored_company');
+                      setRestoreErrorMsg('');
+                      setRestoreErrorCode('');
+                    }}
+                    className="mt-0.5 accent-amber-500"
+                  />
+                  <span>
+                    الاستعادة كمؤسسة مستقلة بمعرف النسخة (
+                    <strong className="font-mono text-amber-300">{pendingRestore.db.company.id}</strong> —{' '}
+                    {pendingRestore.db.company.nameAr})
+                  </span>
+                </label>
+              </div>
+            ) : (
+              <div className="bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-[11px] text-slate-300">
+                سيتم اعتماد الاستعادة داخل منشأتك النشطة (<strong>{db.company.nameAr}</strong>).
+              </div>
+            )}
+
+            {restoreErrorMsg && (
+              <div className="bg-rose-950/40 border border-rose-700/60 text-rose-200 rounded-lg p-2.5 text-[11px] space-y-2">
+                <div>{restoreErrorMsg}</div>
+                {restoreTargetMode === 'restored_company' &&
+                  restoreErrorCode === 'COMPANY_ALREADY_EXISTS' && (
+                    <label className="flex items-center gap-2 cursor-pointer text-amber-300 font-bold">
+                      <input
+                        type="checkbox"
+                        checked={allowReplaceExisting}
+                        onChange={(e) => setAllowReplaceExisting(e.target.checked)}
+                        className="accent-amber-500"
+                      />
+                      <span>تأكيد استبدال بيانات المؤسسة المسجلة مسبقاً ({pendingRestore.db.company.id})</span>
+                    </label>
+                  )}
+              </div>
+            )}
+          </div>
+        )}
+      </ConfirmModal>
 
       {/* Reset confirmation */}
       <ConfirmModal

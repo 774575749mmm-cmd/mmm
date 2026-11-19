@@ -754,6 +754,7 @@ export interface User {
   branchId: string;
   allowedCompanyIds?: string[];
   email: string;
+  phone?: string;
   active: boolean;
   passwordHash?: string;
   passwordSalt?: string;

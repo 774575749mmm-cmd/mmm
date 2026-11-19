@@ -49,6 +49,7 @@ import { assertTenantAccess, isPlatformSuperAdmin } from './services/securitySer
 import {
   cloudApiService,
   hydrateErpDatabaseFromServerState,
+  prepareDatabaseForRestore,
   serverUserToErpUser,
 } from './services/cloudApiService';
 import {
@@ -508,6 +509,9 @@ export default function App() {
         setIsAuthenticated(false);
         setAuthCanCancel(false);
         setAuthModalMode('login');
+        if (data.sessionRevoked) {
+          notify('info', 'تم إنهاء الجلسة السابقة بعد تغيير كلمة المرور أو إبطال الجلسات. يرجى تسجيل الدخول مجدداً.');
+        }
       } catch {
         if (!active) return;
         if (idbData && !hasUserMutatedRef.current) {
@@ -591,14 +595,32 @@ export default function App() {
     }
 
     const activeCid = db.activeCompanyId || db.company.id;
+    if (db.company?.id && db.company.id !== activeCid) {
+      notify(
+        'error',
+        `عزل المنشآت: تم منع حفظ بيانات (${db.company.id}) فوق المنشأة النشطة (${activeCid}).`
+      );
+      return;
+    }
+
     cloudSaveTimerRef.current = setTimeout(async () => {
       cloudSaveTimerRef.current = null;
       const res = await cloudApiService.saveCompanyState(db, activeCid, cloudRevisionRef.current);
       if (res.ok) {
         cloudRevisionRef.current = res.revision;
+      } else if (res.status === 401 && (res.code === 'SESSION_REVOKED' || res.code === 'INVALID_SESSION' || res.code === 'AUTH_REQUIRED')) {
+        setCloudSessionActive(false);
+        setIsAuthenticated(false);
+        setAuthCanCancel(false);
+        setAuthModalMode('login');
+        notify('error', res.error || 'انتهت الجلسة أو تم إبطالها. يرجى تسجيل الدخول مجدداً.');
       } else if (res.conflict) {
         await hydrateWorkspaceFromCloud().catch(() => null);
-        notify('info', 'تم تحديث البيانات من جلسة أحدث على الخادم.');
+        notify('info', 'تعارض تزامن (409): تم تحديث البيانات من جلسة أحدث على الخادم.');
+      } else if (res.status === 403 || res.code === 'TENANT_ISOLATION_VIOLATION' || res.code === 'FORBIDDEN_ROLE') {
+        notify('error', res.error || 'صلاحية مرفوضة (403): عزل المنشآت منع الكتابة فوق هذه المنشأة.');
+      } else {
+        notify('error', res.error || 'تعذر مزامنة البيانات مع الخادم.');
       }
     }, 450);
 
@@ -1783,19 +1805,116 @@ export default function App() {
             onToggleDocumentBook={handleToggleDocumentBook}
             onSetDefaultDocumentBook={handleSetDefaultDocumentBook}
             onResetDatabase={executeResetDatabase}
-            onRestoreDatabase={(restored) => {
+            onRestoreDatabase={async (restored, options) => {
               const check = validateDatabaseObject(restored);
               if (!check.valid || !check.db) {
-                notify('error', check.error || 'ملف النسخة المستعادة تالف أو غير مكتمل.');
-                return;
+                const msg = check.error || 'ملف النسخة المستعادة تالف أو غير مكتمل.';
+                notify('error', msg);
+                return { ok: false, status: 400, code: 'INVALID_BACKUP_PAYLOAD', error: msg };
               }
-              const safeDb = check.db;
-              setDb(safeDb);
-              const restoredScoped = scopeDatabaseToCompany(safeDb);
+
+              const currentActiveCid = db.activeCompanyId || db.company.id;
+              const restoredCid =
+                String(check.db.company?.id || check.db.activeCompanyId || currentActiveCid).trim() ||
+                currentActiveCid;
+              const targetMode: 'current_company' | 'restored_company' =
+                options?.targetMode ||
+                (isPlatformSuperAdmin(currentUser) && restoredCid !== currentActiveCid
+                  ? 'restored_company'
+                  : 'current_company');
+
+              if (targetMode === 'restored_company' && !isPlatformSuperAdmin(currentUser)) {
+                const msg =
+                  'صلاحية مرفوضة (403): إنشاء أو استعادة مؤسسة مستقلة مخصص لمالك المؤسسة (Super Admin) فقط.';
+                notify('error', msg);
+                return { ok: false, status: 403, code: 'FORBIDDEN_SUPER_ADMIN_ONLY', error: msg };
+              }
+
+              const targetCid = targetMode === 'current_company' ? currentActiveCid : restoredCid;
+
+              if (cloudSessionActive) {
+                if (cloudSaveTimerRef.current) {
+                  clearTimeout(cloudSaveTimerRef.current);
+                  cloudSaveTimerRef.current = null;
+                }
+
+                const res = await cloudApiService.restoreCompanyBackup({
+                  targetMode,
+                  targetCompanyId: targetCid,
+                  db: check.db,
+                  expectedRevision: targetMode === 'current_company' ? cloudRevisionRef.current : undefined,
+                  allowReplaceExisting: options?.allowReplaceExisting,
+                  sourceLabel: options?.sourceLabel,
+                });
+
+                if (!res.ok) {
+                  if (res.status === 409 && res.code === 'REVISION_CONFLICT') {
+                    notify(
+                      'error',
+                      res.error || 'تعارض تزامن البيانات (409): يوجد تحديث أحدث على الخادم.'
+                    );
+                  } else if (res.status === 409 && res.code === 'COMPANY_ALREADY_EXISTS') {
+                    notify(
+                      'error',
+                      res.error || 'المنشأة موجودة مسبقاً (409): يرجى تأكيد الاستبدال أو الاستعادة داخل المنشأة الحالية.'
+                    );
+                  } else if (res.status === 403) {
+                    notify(
+                      'error',
+                      res.error || 'صلاحية مرفوضة (403): عزل المنشآت منع اعتماد الاستعادة.'
+                    );
+                  } else {
+                    notify('error', res.error || 'تعذر اعتماد واستعادة النسخة الاحتياطية على الخادم.');
+                  }
+                  return {
+                    ok: false,
+                    status: res.status,
+                    code: res.code,
+                    error: res.error,
+                  };
+                }
+
+                const nextAllowedIds = res.companies.map((c) => c.id);
+                const { hydratedDb } = await hydrateWorkspaceFromCloud();
+                const matchedServerUser = hydratedDb.users.find(
+                  (u) => u.id === currentUser.id && u.active
+                );
+                setCurrentUser((prev) => ({
+                  ...(matchedServerUser || prev),
+                  allowedCompanyIds: nextAllowedIds.length > 0 ? nextAllowedIds : prev.allowedCompanyIds,
+                }));
+                notify(
+                  'success',
+                  `تم اعتماد وحفظ استعادة (${hydratedDb.company.nameAr}) في قاعدة البيانات بنجاح.`
+                );
+                return { ok: true };
+              }
+
+              // Offline / Local-only fallback
+              const preparedLocal = prepareDatabaseForRestore(check.db, targetCid, targetMode);
+              const localCompanies =
+                targetMode === 'current_company'
+                  ? (db.companies || [preparedLocal.company]).map((c) =>
+                      c.id === targetCid ? preparedLocal.company : c
+                    )
+                  : [
+                      ...(db.companies || []).filter((c) => c.id !== preparedLocal.company.id),
+                      preparedLocal.company,
+                    ];
+              const finalLocalDb: ERPDatabase = {
+                ...preparedLocal,
+                companies: localCompanies,
+                users: check.db.users && check.db.users.length > 0 ? check.db.users : db.users,
+              };
+              setDb(finalLocalDb);
+              const restoredScoped = scopeDatabaseToCompany(finalLocalDb, targetCid);
               if (restoredScoped.branches[0]) setCurrentBranch(restoredScoped.branches[0]);
-              const baseCurr = safeDb.currencies.find((c) => c.isBase) || safeDb.currencies[0];
+              const baseCurr =
+                finalLocalDb.currencies.find((c) => c.code === finalLocalDb.company.baseCurrency) ||
+                finalLocalDb.currencies.find((c) => c.isBase) ||
+                finalLocalDb.currencies[0];
               if (baseCurr) setCurrentCurrency(baseCurr);
-              const matchedUser = safeDb.users.find((u) => u.id === currentUser.id && u.active);
+              const matchedUser = finalLocalDb.users.find((u) => u.id === currentUser.id && u.active);
               if (matchedUser) {
                 setCurrentUser(matchedUser);
               } else {
@@ -1803,6 +1922,8 @@ export default function App() {
                 setAuthCanCancel(false);
                 setAuthModalMode('login');
               }
+              notify('success', `تمت استعادة بيانات (${finalLocalDb.company.nameAr}) بنجاح.`);
+              return { ok: true };
             }}
             onUpdateDatabase={setDb}
             onNotify={notify}
@@ -2321,6 +2442,7 @@ export default function App() {
         activeCompanyId={db.activeCompanyId || db.company.id}
         allCompanyIds={(db.companies && db.companies.length > 0 ? db.companies : [db.company]).map((c) => c.id)}
         pendingUserForPasswordChange={pendingPasswordChangeUser}
+        isCloudSession={cloudSessionActive}
         canCancel={authCanCancel}
         lang={lang}
         onBootstrapComplete={async (updatedOwner) => {
@@ -2360,8 +2482,8 @@ export default function App() {
               const matched =
                 hydratedDb.users.find((u) => u.id === resolvedUser.id && u.active) || resolvedUser;
               setCloudSessionActive(true);
-              if (matched.mustChangePassword) {
-                setPendingPasswordChangeUser(matched);
+              if (matched.mustChangePassword || resolvedUser.mustChangePassword) {
+                setPendingPasswordChangeUser({ ...matched, mustChangePassword: true });
                 setIsAuthenticated(false);
                 setAuthModalMode('force_change_password');
                 return;
@@ -2418,16 +2540,19 @@ export default function App() {
           notify('success', `مرحباً ${resolvedUser.fullName}`);
         }}
         onPasswordChanged={(updatedUser) => {
+          const cleanUser = { ...updatedUser, mustChangePassword: false };
           setDb((prev) => ({
             ...prev,
-            users: prev.users.map((u) => (u.id === updatedUser.id ? updatedUser : u)),
+            users: prev.users.some((u) => u.id === cleanUser.id)
+              ? prev.users.map((u) => (u.id === cleanUser.id ? cleanUser : u))
+              : [...prev.users, cleanUser],
           }));
-          setCurrentUser(updatedUser);
+          setCurrentUser(cleanUser);
           setPendingPasswordChangeUser(null);
           setIsAuthenticated(true);
           setAuthModalMode(null);
           setAuthCanCancel(false);
-          notify('success', 'تم تحديث كلمة المرور بنجاح.');
+          notify('success', 'تم تحديث كلمة المرور وتأمين الجلسة بنجاح.');
         }}
         onCancel={() => {
           setAuthModalMode(null);

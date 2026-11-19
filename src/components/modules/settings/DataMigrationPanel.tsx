@@ -28,8 +28,10 @@ import {
   Customer,
   InventoryItem,
   ItemWarehouseStock,
+  User,
   Vendor,
 } from '../../../types/erp';
+import { isPlatformSuperAdmin } from '../../../services/securityService';
 import { exportToExcel } from '../../../services/exportService';
 import {
   ParsedBakDatabase,
@@ -40,9 +42,26 @@ import {
 type MigrationTarget = 'customers' | 'vendors' | 'inventory' | 'accounts';
 type ImportMode = 'merge' | 'replace';
 
+export interface MigrationApplyOptions {
+  targetMode?: 'current_company' | 'restored_company';
+  allowReplaceExisting?: boolean;
+  sourceLabel?: string;
+}
+
+export interface MigrationApplyResult {
+  ok: boolean;
+  error?: string;
+  code?: string;
+  status?: number;
+}
+
 interface DataMigrationPanelProps {
   db: ERPDatabase;
-  onApplyMigration: (updatedDb: ERPDatabase) => void;
+  currentUser?: User;
+  onApplyMigration: (
+    updatedDb: ERPDatabase,
+    options?: MigrationApplyOptions
+  ) => Promise<MigrationApplyResult | void> | void;
 }
 
 const TARGET_LABELS: Record<MigrationTarget, string> = {
@@ -81,8 +100,11 @@ function toNum(val: any, fallback = 0): number {
 
 export const DataMigrationPanel: React.FC<DataMigrationPanelProps> = ({
   db,
+  currentUser,
   onApplyMigration,
 }) => {
+  const isSuperAdmin = currentUser ? isPlatformSuperAdmin(currentUser) : false;
+
   // Excel / CSV state
   const [target, setTarget] = useState<MigrationTarget>('customers');
   const [importMode, setImportMode] = useState<ImportMode>('merge');
@@ -101,6 +123,12 @@ export const DataMigrationPanel: React.FC<DataMigrationPanelProps> = ({
   const [bakMode, setBakMode] = useState<ImportMode>('replace');
   const [includeCompany, setIncludeCompany] = useState(true);
   const [includeRecentInvoices, setIncludeRecentInvoices] = useState(true);
+  const [bakRestoreMode, setBakRestoreMode] = useState<'current_company' | 'restored_company'>(() =>
+    isSuperAdmin ? 'restored_company' : 'current_company'
+  );
+  const [bakAllowReplace, setBakAllowReplace] = useState(false);
+  const [bakCommitting, setBakCommitting] = useState(false);
+  const [bakNeedsReplaceConfirm, setBakNeedsReplaceConfirm] = useState(false);
   const [selectedBakTable, setSelectedBakTable] = useState<string>('');
   const [bakTableRows, setBakTableRows] = useState<Record<string, any>[]>([]);
 
@@ -151,20 +179,49 @@ export const DataMigrationPanel: React.FC<DataMigrationPanelProps> = ({
     setBakTableRows(bakDb.decodeTable(tableName, 15));
   };
 
-  const handleCommitBakMigration = () => {
-    if (!bakDb) return;
-    const { updatedDb, stats } = bakDb.applyQrightMigration(db, bakMode, {
-      includeCompany,
-      includeRecentInvoices,
-    });
-    onApplyMigration(updatedDb);
-    setSuccessMsg(
-      `تم ترحيل البيانات بنجاح إلى نظام المنصور ERP: (${stats.accountsImported} حساب، ${stats.customersImported} عميل، ${stats.vendorsImported} مورد، ${stats.itemsImported} صنف، ${stats.stockRowsImported} رصيد مستودع، ${stats.warehousesImported} مستودع${
-        stats.invoicesImported > 0 || stats.vouchersImported > 0 || stats.journalEntriesImported > 0
-          ? `، ${stats.invoicesImported} فاتورة، ${stats.vouchersImported} سند، ${stats.journalEntriesImported} قيد يومية`
-          : ''
-      }).`
-    );
+  const handleCommitBakMigration = async () => {
+    if (!bakDb || bakCommitting) return;
+    setErrorMsg('');
+    setSuccessMsg('');
+    setBakCommitting(true);
+    try {
+      const effectiveTargetMode: 'current_company' | 'restored_company' =
+        bakMode === 'merge' || !isSuperAdmin ? 'current_company' : bakRestoreMode;
+      const currentCid = db.activeCompanyId || db.company.id;
+      const { updatedDb, stats } = bakDb.applyQrightMigration(db, bakMode, {
+        includeCompany,
+        includeRecentInvoices,
+        targetCompanyId: effectiveTargetMode === 'current_company' ? currentCid : undefined,
+      });
+
+      const res = await onApplyMigration(updatedDb, {
+        targetMode: effectiveTargetMode,
+        allowReplaceExisting: bakAllowReplace,
+        sourceLabel: bakDb.databaseName,
+      });
+
+      if (res && !res.ok) {
+        if (res.code === 'COMPANY_ALREADY_EXISTS' || res.status === 409) {
+          setBakNeedsReplaceConfirm(true);
+        }
+        setErrorMsg(res.error || 'تعذر اعتماد ترحيل النسخة الاحتياطية على الخادم.');
+        return;
+      }
+
+      setBakNeedsReplaceConfirm(false);
+      setBakAllowReplace(false);
+      setSuccessMsg(
+        `تم ترحيل البيانات بنجاح إلى نظام المنصور ERP: (${stats.accountsImported} حساب، ${stats.customersImported} عميل، ${stats.vendorsImported} مورد، ${stats.itemsImported} صنف، ${stats.stockRowsImported} رصيد مستودع، ${stats.warehousesImported} مستودع${
+          stats.invoicesImported > 0 || stats.vouchersImported > 0 || stats.journalEntriesImported > 0
+            ? `، ${stats.invoicesImported} فاتورة، ${stats.vouchersImported} سند، ${stats.journalEntriesImported} قيد يومية`
+            : ''
+        }).`
+      );
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'تعذر إتمام عملية الترحيل.');
+    } finally {
+      setBakCommitting(false);
+    }
   };
 
   const handleExcelCsvFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -202,8 +259,10 @@ export const DataMigrationPanel: React.FC<DataMigrationPanelProps> = ({
     }
   };
 
-  const handleCommitExcelImport = () => {
+  const handleCommitExcelImport = async () => {
     if (parsedRows.length === 0) return;
+    setErrorMsg('');
+    setSuccessMsg('');
 
     const now = new Date().toISOString();
     const today = now.split('T')[0];
@@ -542,18 +601,25 @@ export const DataMigrationPanel: React.FC<DataMigrationPanelProps> = ({
       ...db.auditLogs,
     ];
 
+    const applyRes = await onApplyMigration(updatedDb, {
+      targetMode: 'current_company',
+      sourceLabel: fileName || 'excel-import',
+    });
+    if (applyRes && !applyRes.ok) {
+      setErrorMsg(applyRes.error || 'تعذر حفظ البيانات المستوردة على الخادم.');
+      return;
+    }
     setRollbackSnapshot({
       db: preImportDbSnapshot,
       logId: importLogId,
       label: `${TARGET_LABELS[target]} (${importedCount} سجل)`,
     });
-    onApplyMigration(updatedDb);
     setSuccessMsg(`تم استيراد وترحيل ${importedCount} سجل بنجاح (تم تخطي ${skippedDuplicates} مكرر) إلى (${TARGET_LABELS[target]}).`);
     setParsedRows([]);
     setFileName('');
   };
 
-  const handleRollbackLastImport = () => {
+  const handleRollbackLastImport = async () => {
     if (!rollbackSnapshot) return;
     const rolledDb: ERPDatabase = {
       ...rollbackSnapshot.db,
@@ -561,7 +627,14 @@ export const DataMigrationPanel: React.FC<DataMigrationPanelProps> = ({
         l.id === rollbackSnapshot.logId ? { ...l, status: 'rolled_back' as const } : l
       ),
     };
-    onApplyMigration(rolledDb);
+    const res = await onApplyMigration(rolledDb, {
+      targetMode: 'current_company',
+      sourceLabel: `rollback-${rollbackSnapshot.logId}`,
+    });
+    if (res && !res.ok) {
+      setErrorMsg(res.error || 'تعذر التراجع عن الاستيراد على الخادم.');
+      return;
+    }
     setSuccessMsg(`تم التراجع الذري (Rollback) عن عملية استيراد: ${rollbackSnapshot.label}.`);
     setRollbackSnapshot(null);
   };
@@ -761,14 +834,59 @@ SELECT * FROM StoresInventory;
                     <div className="flex justify-end">
                       <button
                         type="button"
-                        onClick={handleCommitBakMigration}
-                        className="w-full py-2.5 px-4 bg-amber-500 hover:bg-amber-600 text-slate-950 font-black rounded-xl flex items-center justify-center gap-2 transition-colors cursor-pointer shadow-md"
+                        disabled={bakCommitting}
+                        onClick={() => void handleCommitBakMigration()}
+                        className="w-full py-2.5 px-4 bg-amber-500 hover:bg-amber-600 disabled:opacity-60 text-slate-950 font-black rounded-xl flex items-center justify-center gap-2 transition-colors cursor-pointer shadow-md"
                       >
-                        <RefreshCw className="w-4 h-4" />
-                        <span>ترحيل البيانات إلى نظام المنصور ERP</span>
+                        <RefreshCw className={`w-4 h-4 ${bakCommitting ? 'animate-spin' : ''}`} />
+                        <span>{bakCommitting ? 'جاري الاعتماد والحفظ في قاعدة البيانات...' : 'ترحيل البيانات إلى نظام المنصور ERP'}</span>
                       </button>
                     </div>
                   </div>
+
+                  {isSuperAdmin && bakMode === 'replace' && (
+                    <div className="pt-2 border-t border-slate-800/80 flex flex-wrap items-center gap-4 text-[11px] text-slate-300">
+                      <span className="font-bold text-amber-300">وجهة الاستعادة:</span>
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="radio"
+                          name="bakRestoreMode"
+                          checked={bakRestoreMode === 'restored_company'}
+                          onChange={() => {
+                            setBakRestoreMode('restored_company');
+                            setBakNeedsReplaceConfirm(false);
+                          }}
+                          className="accent-amber-500"
+                        />
+                        <span>إنشاء / ربط كمؤسسة مستقلة بمعرفها (comp-bak-1)</span>
+                      </label>
+                      <label className="flex items-center gap-1.5 cursor-pointer">
+                        <input
+                          type="radio"
+                          name="bakRestoreMode"
+                          checked={bakRestoreMode === 'current_company'}
+                          onChange={() => {
+                            setBakRestoreMode('current_company');
+                            setBakNeedsReplaceConfirm(false);
+                            setBakAllowReplace(false);
+                          }}
+                          className="accent-amber-500"
+                        />
+                        <span>الاستعادة داخل المؤسسة النشطة الحالية ({db.company.nameAr})</span>
+                      </label>
+                      {bakNeedsReplaceConfirm && bakRestoreMode === 'restored_company' && (
+                        <label className="flex items-center gap-1.5 cursor-pointer text-amber-300 font-bold">
+                          <input
+                            type="checkbox"
+                            checked={bakAllowReplace}
+                            onChange={(e) => setBakAllowReplace(e.target.checked)}
+                            className="accent-amber-500"
+                          />
+                          <span>تأكيد استبدال بيانات المؤسسة المستقلة المسجلة مسبقاً</span>
+                        </label>
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
 

@@ -12,8 +12,15 @@ import { PGlite } from '@electric-sql/pglite';
 import {
   ALL_MIGRATIONS,
   TENANT_RLS_TABLES,
+  type MigrationDefinition,
   type SqlExecutor,
 } from '../migrations/001_multi_tenant_core.ts';
+import { migration002AuthSessionVersionAndContact } from '../migrations/002_auth_session_version_and_contact.ts';
+
+export const REGISTERED_MIGRATIONS: MigrationDefinition[] = [
+  ...ALL_MIGRATIONS,
+  migration002AuthSessionVersionAndContact,
+];
 
 export interface TenantDbContext {
   companyId?: string;
@@ -342,7 +349,7 @@ export async function runMigrations(db: PgExecutor): Promise<string[]> {
   const appliedIds = new Set(appliedRes.rows.map((r) => String(r.id)));
   const newlyApplied: string[] = [];
 
-  for (const migration of ALL_MIGRATIONS) {
+  for (const migration of REGISTERED_MIGRATIONS) {
     if (appliedIds.has(migration.id)) continue;
     await db.transaction(
       async (tx) => {
@@ -383,7 +390,7 @@ export async function rollbackLastMigration(db: PgExecutor): Promise<string | nu
   const lastId = res.rows[0]?.id;
   if (!lastId) return null;
 
-  const migration = ALL_MIGRATIONS.find((m) => m.id === lastId);
+  const migration = REGISTERED_MIGRATIONS.find((m) => m.id === lastId);
   if (!migration) {
     throw new Error(`Migration definition not found for rollback: ${lastId}`);
   }

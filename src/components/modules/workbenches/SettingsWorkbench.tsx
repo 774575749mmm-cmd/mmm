@@ -82,7 +82,14 @@ interface SettingsWorkbenchProps {
   onToggleDocumentBook: (bookId: string) => void;
   onSetDefaultDocumentBook: (bookId: string) => void;
   onResetDatabase: () => void;
-  onRestoreDatabase: (restored: ERPDatabase) => void;
+  onRestoreDatabase: (
+    restored: ERPDatabase,
+    options?: {
+      targetMode?: 'current_company' | 'restored_company';
+      allowReplaceExisting?: boolean;
+      sourceLabel?: string;
+    }
+  ) => Promise<{ ok: boolean; error?: string; code?: string; status?: number } | void> | void;
   onUpdateDatabase?: (nextDb: ERPDatabase) => void;
   onNotify: (type: 'success' | 'error' | 'info', msg: string) => void;
 }

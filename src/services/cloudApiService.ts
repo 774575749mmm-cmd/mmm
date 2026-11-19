@@ -31,12 +31,15 @@ export interface ServerPublicUserDto {
   username: string;
   fullName: string;
   email?: string;
+  phone?: string;
   role: string;
   isSuperAdmin?: boolean;
   allowedCompanyIds: string[];
   branchId: string;
   active: boolean;
   mustChangePassword?: boolean;
+  sessionVersion?: number;
+  passwordChangedAt?: string | null;
   companyId?: string | null;
   lastActiveCompanyId?: string | null;
   flags?: {
@@ -75,6 +78,7 @@ export interface AuthStatusPayload {
   ok: boolean;
   initialized: boolean;
   authenticated: boolean;
+  sessionRevoked?: boolean;
   user: ServerPublicUserDto | null;
   companies: ServerCompanyDto[];
   activeCompanyId: string | null;
@@ -138,6 +142,7 @@ export function serverUserToErpUser(su: ServerPublicUserDto): User {
     branchId: su.branchId || 'br-01',
     allowedCompanyIds: Array.isArray(su.allowedCompanyIds) ? [...su.allowedCompanyIds] : [],
     email: su.email || `${su.username}@almansoor.erp`,
+    phone: su.phone || '',
     active: su.active !== false,
     mustChangePassword: Boolean(su.mustChangePassword),
     canViewReports: flags.canViewReports ?? true,
@@ -324,6 +329,90 @@ export function hydrateErpDatabaseFromServerState(
   return scopeDatabaseToCompany(migrateDatabase(cleanPayload), companyId);
 }
 
+const RESTORE_SCOPED_COLLECTIONS = [
+  'branches',
+  'warehouses',
+  'departments',
+  'customers',
+  'vendors',
+  'inventoryItems',
+  'warehouseStock',
+  'stockCostLayers',
+  'inventoryBatches',
+  'storageLocations',
+  'stockMovements',
+  'inventoryTransfers',
+  'stocktakings',
+  'warehouseDocuments',
+  'documentBooks',
+  'chartOfAccounts',
+  'costCenters',
+  'journalEntries',
+  'fiscalPeriods',
+  'invoices',
+  'commercialOrders',
+  'treasuryAccounts',
+  'paymentVouchers',
+  'treasuryTransfers',
+  'bankReconciliations',
+  'posShifts',
+  'heldPosCarts',
+  'expenseCategories',
+  'expenseRecords',
+  'employees',
+  'payrollRuns',
+  'fixedAssets',
+  'customBooks',
+  'customBookEntries',
+  'approvalRules',
+  'approvalRequests',
+  'fxRevaluations',
+  'savedReportDesigns',
+  'auditLogs',
+  'taskAlerts',
+  'dispatchLogs',
+] as const;
+
+export function prepareDatabaseForRestore(
+  db: ERPDatabase,
+  targetCompanyId: string,
+  targetMode: 'current_company' | 'restored_company'
+): ERPDatabase {
+  const cleanCid = String(targetCompanyId || db.activeCompanyId || db.company.id).trim();
+  const next: Record<string, unknown> = { ...db };
+
+  for (const key of RESTORE_SCOPED_COLLECTIONS) {
+    const arr = next[key];
+    if (!Array.isArray(arr)) continue;
+    next[key] = arr.map((item) => {
+      if (!item || typeof item !== 'object') return item;
+      const rec = item as Record<string, unknown>;
+      if (
+        targetMode === 'current_company' ||
+        rec.companyId === undefined ||
+        rec.companyId === null ||
+        String(rec.companyId).trim() === ''
+      ) {
+        return { ...rec, companyId: cleanCid };
+      }
+      return rec;
+    });
+  }
+
+  const nextCompany: Company = {
+    ...db.company,
+    id: cleanCid,
+    isActive: db.company.isActive !== false,
+  };
+
+  return {
+    ...(next as unknown as ERPDatabase),
+    company: nextCompany,
+    activeCompanyId: cleanCid,
+    companies: [nextCompany],
+  };
+}
+
 export function extractScopedCloudStatePayload(db: ERPDatabase, companyId: string): Record<string, unknown> {
   const scoped = scopeDatabaseToCompany(db, companyId);
   const { users: _u, companies: _c, ...rest } = scoped;
@@ -368,14 +457,16 @@ export const cloudApiService = {
     username: string;
     fullName: string;
     email?: string;
+    phone?: string;
     password: string;
-    company?: {
+    company: {
       nameAr: string;
       nameEn?: string;
       countryCode?: string;
       baseCurrency?: string;
       taxNumber?: string;
       commercialRecord?: string;
+      phone?: string;
     };
   }) {
     const res = await fetch('/api/auth/register', {
@@ -390,6 +481,49 @@ export const cloudApiService = {
       companies: ServerCompanyDto[];
       activeCompanyId: string | null;
       licenseBoundary?: LicenseEvaluationResult;
+    }>(res);
+    return { ok: res.ok, status: res.status, data };
+  },
+
+  async completeForcedPasswordChange(newPassword: string) {
+    const res = await fetch('/api/auth/complete-forced-password-change', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ newPassword }),
+    });
+    const data = await parseJsonSafe<{
+      user?: ServerPublicUserDto;
+      activeCompanyId?: string;
+      revokedPreviousSessions?: boolean;
+    }>(res);
+    return { ok: res.ok, status: res.status, data };
+  },
+
+  async changePassword(currentPassword: string, newPassword: string) {
+    const res = await fetch('/api/auth/change-password', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ currentPassword, newPassword }),
+    });
+    const data = await parseJsonSafe<{
+      user?: ServerPublicUserDto;
+      revokedPreviousSessions?: boolean;
+    }>(res);
+    return { ok: res.ok, status: res.status, data };
+  },
+
+  async revokeSessions(keepCurrent = true) {
+    const res = await fetch('/api/auth/revoke-sessions', {
+      method: 'POST',
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ keepCurrent }),
+    });
+    const data = await parseJsonSafe<{
+      sessionVersion?: number;
+      keptCurrentSession?: boolean;
     }>(res);
     return { ok: res.ok, status: res.status, data };
   },
@@ -562,12 +696,18 @@ export const cloudApiService = {
     db: ERPDatabase,
     companyId: string,
     expectedRevision?: number
-  ): Promise<{ ok: true; revision: number } | { ok: false; conflict?: boolean; error: string; serverRevision?: number }> {
+  ): Promise<
+    | { ok: true; revision: number }
+    | { ok: false; status?: number; code?: string; conflict?: boolean; error: string; serverRevision?: number }
+  > {
     const payloadState = extractScopedCloudStatePayload(db, companyId);
     const res = await fetch('/api/company/state', {
       method: 'PUT',
       credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Company-Id': companyId,
+      },
       body: JSON.stringify({
         companyId,
         expectedRevision,
@@ -578,6 +718,8 @@ export const cloudApiService = {
     if (!res.ok) {
       return {
         ok: false,
+        status: res.status,
+        code: data.code,
         conflict: res.status === 409,
         serverRevision: data.serverRevision,
         error: data.error || 'تعذر حفظ بيانات المنشأة في الخادم.',
@@ -586,11 +728,108 @@ export const cloudApiService = {
     return { ok: true, revision: data.revision || (expectedRevision ?? 0) + 1 };
   },
 
+  async restoreCompanyBackup(params: {
+    targetMode: 'current_company' | 'restored_company';
+    targetCompanyId?: string;
+    db: ERPDatabase;
+    expectedRevision?: number;
+    allowReplaceExisting?: boolean;
+    sourceLabel?: string;
+  }): Promise<
+    | {
+        ok: true;
+        company: ServerCompanyDto;
+        companies: ServerCompanyDto[];
+        activeCompanyId: string;
+        revision: number;
+        licenseBoundary?: LicenseEvaluationResult;
+      }
+    | {
+        ok: false;
+        status: number;
+        code?: string;
+        conflict?: boolean;
+        serverRevision?: number;
+        error: string;
+      }
+  > {
+    const targetCid = String(
+      params.targetCompanyId || params.db.company?.id || params.db.activeCompanyId || ''
+    ).trim();
+    const prepared = prepareDatabaseForRestore(params.db, targetCid, params.targetMode);
+    const { users: _u, companies: _c, ...statePayload } = prepared;
+    const companyProfile = {
+      id: targetCid,
+      nameAr: prepared.company.nameAr,
+      nameEn: prepared.company.nameEn || prepared.company.nameAr,
+      countryCode: prepared.company.countryCode || 'YE',
+      baseCurrency: prepared.company.baseCurrency || 'YER',
+      valuationPolicy: prepared.company.valuationPolicy || 'PER_ITEM',
+      commercialRecord: prepared.company.commercialRecord || '',
+      taxNumber: prepared.company.taxNumber || '',
+      phone: prepared.company.phone || '',
+      email: prepared.company.email || '',
+      address: prepared.company.address || '',
+      fiscalYearStart: prepared.company.fiscalYearStart || '2026-01-01',
+    };
+
+    const res = await fetch('/api/company/restore', {
+      method: 'POST',
+      credentials: 'include',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        targetMode: params.targetMode,
+        targetCompanyId: targetCid || undefined,
+        companyProfile,
+        state: {
+          ...statePayload,
+          company: { ...prepared.company, id: targetCid },
+          activeCompanyId: targetCid,
+        },
+        expectedRevision: params.expectedRevision,
+        allowReplaceExisting: params.allowReplaceExisting,
+        sourceLabel: params.sourceLabel,
+      }),
+    });
+
+    const data = await parseJsonSafe<{
+      company: ServerCompanyDto;
+      companies: ServerCompanyDto[];
+      activeCompanyId: string;
+      revision: number;
+      licenseBoundary?: LicenseEvaluationResult;
+      serverRevision?: number;
+    }>(res);
+
+    if (!res.ok) {
+      return {
+        ok: false,
+        status: res.status,
+        code: data.code,
+        conflict: res.status === 409,
+        serverRevision: data.serverRevision,
+        error: data.error || 'تعذر اعتماد واستعادة النسخة الاحتياطية على الخادم.',
+      };
+    }
+
+    return {
+      ok: true,
+      company: data.company,
+      companies: data.companies || [],
+      activeCompanyId: data.activeCompanyId,
+      revision: data.revision,
+      licenseBoundary: data.licenseBoundary,
+    };
+  },
+
   async saveCompanyUser(payload: {
     id: string;
     username: string;
     fullName: string;
     email?: string;
+    phone?: string;
     role: string;
     allowedCompanyIds?: string[];
     branchId?: string;

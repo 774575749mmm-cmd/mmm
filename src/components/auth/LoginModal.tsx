@@ -33,6 +33,7 @@ interface LoginModalProps {
   activeCompanyId: string;
   allCompanyIds: string[];
   pendingUserForPasswordChange?: User | null;
+  isCloudSession?: boolean;
   canCancel?: boolean;
   lang: AppLanguage;
   onBootstrapComplete: (updatedOwner: User) => void;
@@ -52,6 +53,7 @@ export const LoginModal: React.FC<LoginModalProps> = ({
   activeCompanyId,
   allCompanyIds,
   pendingUserForPasswordChange,
+  isCloudSession = false,
   canCancel = false,
   lang,
   onBootstrapComplete,
@@ -65,6 +67,8 @@ export const LoginModal: React.FC<LoginModalProps> = ({
   const [confirmPassword, setConfirmPassword] = useState('');
   const [isRegisterMode, setIsRegisterMode] = useState(false);
   const [fullName, setFullName] = useState('');
+  const [email, setEmail] = useState('');
+  const [phone, setPhone] = useState('');
   const [companyNameAr, setCompanyNameAr] = useState('');
   const [countryCode, setCountryCode] = useState<CountryPackCode>('YE');
   const [error, setError] = useState<string | null>(null);
@@ -75,9 +79,13 @@ export const LoginModal: React.FC<LoginModalProps> = ({
     setPassword('');
     setConfirmPassword('');
     setIsRegisterMode(false);
+    setEmail('');
+    setPhone('');
     if (mode === 'bootstrap') {
       const owner = users.find((u) => u.role === 'مالك المؤسسة') || users[0];
       setUsername(owner?.username?.trim() || 'admin');
+      setEmail(owner?.email && !owner.email.endsWith('@almansoor.erp') ? owner.email : '');
+      setPhone(owner?.phone || '');
     }
   }, [isOpen, mode, users]);
 
@@ -126,6 +134,8 @@ export const LoginModal: React.FC<LoginModalProps> = ({
 
       const companyScope =
         allCompanyIds.length > 0 ? allCompanyIds : [activeCompanyId || 'comp-01'];
+      const cleanEmail = email.trim() || owner.email || `${cleanUsername}@almansoor.erp`;
+      const cleanPhone = phone.trim() || owner.phone || '';
 
       const resp = await fetch('/api/auth/bootstrap', {
         method: 'POST',
@@ -135,15 +145,20 @@ export const LoginModal: React.FC<LoginModalProps> = ({
           id: owner.id,
           username: owner.username,
           fullName: owner.fullName,
+          email: cleanEmail,
+          phone: cleanPhone,
           allowedCompanyIds: companyScope,
           branchId: owner.branchId,
           password,
         }),
       });
+      const respBody = (await resp.json().catch(() => ({}))) as {
+        error?: string;
+        user?: ServerPublicUserDto;
+      };
       if (!resp.ok) {
-        const body = await resp.json().catch(() => ({}));
         setError(
-          body?.error ||
+          respBody?.error ||
             (isEn ? 'Failed initializing owner credentials.' : 'تعذر تفعيل كلمة مرور المالك على الخادم.')
         );
         return;
@@ -151,14 +166,18 @@ export const LoginModal: React.FC<LoginModalProps> = ({
 
       const salt = generateSaltHex(16);
       const hash = await hashPasswordAsync(password, salt);
+      const serverOwner = respBody.user ? serverUserToErpUser(respBody.user) : owner;
       const updatedOwner: User = {
         ...owner,
+        ...serverOwner,
+        email: serverOwner.email || cleanEmail,
+        phone: serverOwner.phone || cleanPhone,
         isSuperAdmin: true,
         passwordSalt: salt,
         passwordHash: hash,
         mustChangePassword: false,
         allowedCompanyIds: Array.from(
-          new Set([...(owner.allowedCompanyIds || []), ...companyScope])
+          new Set([...(serverOwner.allowedCompanyIds || []), ...(owner.allowedCompanyIds || []), ...companyScope])
         ),
       };
       onBootstrapComplete(updatedOwner);
@@ -175,6 +194,8 @@ export const LoginModal: React.FC<LoginModalProps> = ({
     const cleanUser = username.trim();
     const cleanFull = fullName.trim();
     const cleanCompany = companyNameAr.trim();
+    const cleanEmail = email.trim();
+    const cleanPhone = phone.trim();
 
     if (!cleanUser || !cleanFull || !cleanCompany) {
       setError(
@@ -201,12 +222,15 @@ export const LoginModal: React.FC<LoginModalProps> = ({
       const regRes = await cloudApiService.register({
         username: cleanUser,
         fullName: cleanFull,
+        email: cleanEmail || undefined,
+        phone: cleanPhone || undefined,
         password,
         company: {
           nameAr: cleanCompany,
           nameEn: cleanCompany,
           countryCode,
           baseCurrency: pack.baseCurrency,
+          phone: cleanPhone || undefined,
         },
       });
 
@@ -357,26 +381,47 @@ export const LoginModal: React.FC<LoginModalProps> = ({
     try {
       const salt = generateSaltHex(16);
       const hash = await hashPasswordAsync(password, salt);
-      await cloudApiService
-        .saveCompanyUser({
-          id: pendingUserForPasswordChange.id,
-          username: pendingUserForPasswordChange.username,
-          fullName: pendingUserForPasswordChange.fullName,
-          role: pendingUserForPasswordChange.role,
-          allowedCompanyIds: pendingUserForPasswordChange.allowedCompanyIds || [activeCompanyId],
-          branchId: pendingUserForPasswordChange.branchId,
-          active: pendingUserForPasswordChange.active,
-          password,
-          mustChangePassword: false,
-        })
-        .catch(() => null);
 
+      if (isCloudSession) {
+        const res = await cloudApiService.completeForcedPasswordChange(password);
+        if (!res.ok) {
+          setError(
+            res.data.error ||
+              (isEn
+                ? 'Failed saving your new password on the server.'
+                : 'تعذر حفظ كلمة المرور الجديدة على الخادم. يرجى المحاولة مجدداً.')
+          );
+          return;
+        }
+
+        const serverErpUser = res.data.user
+          ? serverUserToErpUser(res.data.user)
+          : pendingUserForPasswordChange;
+        onPasswordChanged({
+          ...pendingUserForPasswordChange,
+          ...serverErpUser,
+          passwordSalt: salt,
+          passwordHash: hash,
+          mustChangePassword: false,
+        });
+        return;
+      }
+
+      // Offline local-only session fallback (never used when cloudAuthenticated)
       onPasswordChanged({
         ...pendingUserForPasswordChange,
         passwordSalt: salt,
         passwordHash: hash,
         mustChangePassword: false,
       });
+    } catch (err: unknown) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : isEn
+          ? 'Unable to connect to the server to update password.'
+          : 'تعذر الاتصال بالخادم لتحديث كلمة المرور.'
+      );
     } finally {
       setIsSubmitting(false);
     }
@@ -507,7 +552,15 @@ export const LoginModal: React.FC<LoginModalProps> = ({
             <div>
               <label className="block font-bold text-slate-300 mb-1 flex items-center gap-1.5">
                 <UserCheck className="w-3.5 h-3.5 text-[var(--gold)]" />
-                <span>{isEn ? 'Username' : 'اسم المستخدم'}</span>
+                <span>
+                  {mode === 'login' && !isRegisterMode
+                    ? isEn
+                      ? 'Username or Email'
+                      : 'اسم المستخدم أو البريد الإلكتروني'
+                    : isEn
+                    ? 'Username'
+                    : 'اسم المستخدم'}
+                </span>
               </label>
               <input
                 type="text"
@@ -515,10 +568,41 @@ export const LoginModal: React.FC<LoginModalProps> = ({
                 readOnly={mode === 'bootstrap'}
                 value={username}
                 onChange={(e) => setUsername(e.target.value)}
-                placeholder="admin"
+                placeholder={mode === 'login' && !isRegisterMode ? 'admin / name@company.com' : 'admin'}
                 className="w-full v20-input px-3 py-2 font-mono"
                 autoComplete="username"
               />
+            </div>
+          )}
+
+          {(mode === 'bootstrap' || (mode === 'login' && isRegisterMode)) && (
+            <div className="grid grid-cols-2 gap-2">
+              <div>
+                <label className="block font-bold text-slate-300 mb-1">
+                  {isEn ? 'Email (Optional)' : 'البريد الإلكتروني (اختياري)'}
+                </label>
+                <input
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="owner@company.com"
+                  className="w-full v20-input px-3 py-2 font-mono"
+                  autoComplete="email"
+                />
+              </div>
+              <div>
+                <label className="block font-bold text-slate-300 mb-1">
+                  {isEn ? 'Phone (Optional)' : 'رقم الجوال (اختياري)'}
+                </label>
+                <input
+                  type="tel"
+                  value={phone}
+                  onChange={(e) => setPhone(e.target.value)}
+                  placeholder="+967770000000"
+                  className="w-full v20-input px-3 py-2 font-mono"
+                  autoComplete="tel"
+                />
+              </div>
             </div>
           )}
 

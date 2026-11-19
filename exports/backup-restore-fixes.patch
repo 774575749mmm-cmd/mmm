@@ -1,0 +1,3011 @@
+diff --git a/server/app.ts b/server/app.ts
+index 7a9def8..303006f 100644
+--- a/server/app.ts
++++ b/server/app.ts
+@@ -1593,6 +1593,139 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
+     }
+   });
+ 
++  app.post(
++    '/api/company/restore',
++    requireAuth,
++    requireRoles(ADMIN_ROLES),
++    async (req: AuthenticatedRequest, res: Response) => {
++      try {
++        if (!pgRepo) {
++          res.status(501).json({
++            ok: false,
++            code: 'POSTGRES_REQUIRED',
++            error: 'استعادة النسخة الاحتياطية وحفظها تتطلب قاعدة بيانات PostgreSQL.',
++          });
++          return;
++        }
++        const actor = req.authUser!;
++        const sessionCompanyId = req.authSession?.companyId || '';
++        if (!sessionCompanyId) {
++          res.status(403).json({
++            ok: false,
++            code: 'NO_COMPANY_ACCESS',
++            error: 'عذراً، هذا الحساب لا يملك منشأة نشطة مصرح بها.',
++          });
++          return;
++        }
++
++        const headerCid = String(req.headers['x-company-id'] || '').trim();
++        if (headerCid && headerCid !== sessionCompanyId) {
++          res.status(403).json({
++            ok: false,
++            code: 'TENANT_ISOLATION_VIOLATION',
++            error: 'عزل المنشآت: معرف المنشأة في الترويسة مخالف للجلسة الموثقة.',
++          });
++          return;
++        }
++
++        const body = (req.body || {}) as {
++          targetMode?: string;
++          targetCompanyId?: string;
++          companyProfile?: Record<string, unknown>;
++          state?: Record<string, unknown>;
++          expectedRevision?: number;
++          allowReplaceExisting?: boolean;
++          sourceLabel?: string;
++        };
++
++        const targetMode =
++          body.targetMode === 'restored_company'
++            ? 'restored_company'
++            : body.targetMode === 'current_company' || !body.targetMode
++            ? 'current_company'
++            : null;
++
++        if (!targetMode) {
++          res.status(400).json({
++            ok: false,
++            code: 'INVALID_RESTORE_MODE',
++            error: 'وضع استعادة النسخة غير صالح (المسموح: current_company أو restored_company).',
++          });
++          return;
++        }
++
++        if (targetMode === 'restored_company' && !actor.isSuperAdmin) {
++          res.status(403).json({
++            ok: false,
++            code: 'FORBIDDEN_SUPER_ADMIN_ONLY',
++            error: 'صلاحية مرفوضة: إنشاء مؤسسة مستقلة من النسخة الاحتياطية مخصص لمالك المؤسسة (Super Admin) فقط.',
++          });
++          return;
++        }
++
++        if (!body.state || typeof body.state !== 'object' || Array.isArray(body.state)) {
++          res.status(400).json({
++            ok: false,
++            code: 'INVALID_BACKUP_PAYLOAD',
++            error: 'بيانات النسخة الاحتياطية غير صالحة أو مفقودة.',
++          });
++          return;
++        }
++
++        const restoreRes = await pgRepo.restoreCompanyBackup({
++          actor,
++          sessionCompanyId,
++          targetMode,
++          targetCompanyId: body.targetCompanyId ? String(body.targetCompanyId).trim() : undefined,
++          companyProfile: body.companyProfile as Record<string, unknown> | undefined,
++          state: body.state,
++          expectedRevision:
++            typeof body.expectedRevision === 'number' ? body.expectedRevision : undefined,
++          allowReplaceExisting: Boolean(body.allowReplaceExisting),
++          sourceLabel: body.sourceLabel ? String(body.sourceLabel).slice(0, 120) : undefined,
++        });
++
++        if (!restoreRes.ok) {
++          res.status(restoreRes.status).json({
++            ok: false,
++            code: restoreRes.code,
++            error: restoreRes.error,
++            serverRevision: restoreRes.serverRevision,
++          });
++          return;
++        }
++
++        const now = Date.now();
++        const allowedIds = restoreRes.companies.map((c) => c.id);
++        const token = signSessionToken({
++          userId: actor.id,
++          username: actor.username,
++          role: actor.role,
++          isSuperAdmin: Boolean(actor.isSuperAdmin),
++          companyId: restoreRes.activeCompanyId,
++          allowedCompanyIds: allowedIds,
++          iat: now,
++          exp: now + SESSION_TTL_MS,
++        });
++        setSessionCookie(req, res, token, isProduction);
++
++        res.json({
++          ok: true,
++          company: restoreRes.company,
++          companies: restoreRes.companies,
++          activeCompanyId: restoreRes.activeCompanyId,
++          revision: restoreRes.revision,
++          licenseBoundary: evaluateLicenseBoundary(restoreRes.license),
++        });
++      } catch (err) {
++        res.status(500).json({
++          ok: false,
++          error: err instanceof Error ? err.message : 'Failed restoring company backup',
++        });
++      }
++    }
++  );
++
+   // Tenant-Scoped User Management (strictly restricted to active session companyId)
+   app.get('/api/company/users', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+     try {
+diff --git a/server/tenantRepository.ts b/server/tenantRepository.ts
+index 45658fe..91a8a85 100644
+--- a/server/tenantRepository.ts
++++ b/server/tenantRepository.ts
+@@ -1575,6 +1575,496 @@ export class PgTenantRepository {
+     );
+   }
+ 
++  async restoreCompanyBackup(params: {
++    actor: ServerUserRecord;
++    sessionCompanyId: string;
++    targetMode: 'current_company' | 'restored_company';
++    targetCompanyId?: string;
++    companyProfile?: Partial<ServerCompanyRecord>;
++    state: Record<string, unknown>;
++    expectedRevision?: number;
++    allowReplaceExisting?: boolean;
++    sourceLabel?: string;
++  }): Promise<
++    | {
++        ok: true;
++        company: ServerCompanyRecord;
++        companies: ServerCompanyRecord[];
++        activeCompanyId: string;
++        revision: number;
++        license: ServerLicenseRecord;
++      }
++    | { ok: false; status: number; code: string; error: string; serverRevision?: number }
++  > {
++    if (!params.state || typeof params.state !== 'object' || Array.isArray(params.state)) {
++      return {
++        ok: false,
++        status: 400,
++        code: 'INVALID_BACKUP_PAYLOAD',
++        error: 'ملف النسخة الاحتياطية غير صالح أو فارغ.',
++      };
++    }
++
++    const sessionCid = String(params.sessionCompanyId || '').trim();
++    const rawRequestedTargetCid = String(
++      params.targetCompanyId ||
++        params.companyProfile?.id ||
++        (params.state.company as { id?: unknown } | undefined)?.id ||
++        ''
++    ).trim();
++
++    if (params.targetMode === 'current_company') {
++      if (!sessionCid) {
++        return {
++          ok: false,
++          status: 403,
++          code: 'NO_COMPANY_ACCESS',
++          error: 'لا توجد منشأة نشطة مصرح بها في الجلسة الحالية.',
++        };
++      }
++      if (params.targetCompanyId && params.targetCompanyId.trim() !== sessionCid) {
++        return {
++          ok: false,
++          status: 403,
++          code: 'TENANT_ISOLATION_VIOLATION',
++          error: `عزل المنشآت: لا يمكن الكتابة فوق منشأة أخرى (${params.targetCompanyId.trim()}) أثناء جلسة (${sessionCid}).`,
++        };
++      }
++    } else if (params.targetMode === 'restored_company') {
++      if (!params.actor.isSuperAdmin) {
++        return {
++          ok: false,
++          status: 403,
++          code: 'FORBIDDEN_SUPER_ADMIN_ONLY',
++          error: 'صلاحية مرفوضة: استعادة نسخة كمنشأة مستقلة مخصص لمالك المؤسسة (Super Admin) فقط.',
++        };
++      }
++      if (!rawRequestedTargetCid) {
++        return {
++          ok: false,
++          status: 400,
++          code: 'COMPANY_ID_REQUIRED',
++          error: 'معرف المنشأة غير موجود في النسخة الاحتياطية.',
++        };
++      }
++    } else {
++      return {
++        ok: false,
++        status: 400,
++        code: 'INVALID_RESTORE_MODE',
++        error: 'وضع الاستعادة غير صالح.',
++      };
++    }
++
++    const resolvedTargetCompanyId =
++      params.targetMode === 'current_company' ? sessionCid : rawRequestedTargetCid;
++
++    // Never import user credentials, passwords, or privilege matrices from backups
++    const sanitizedInput: Record<string, unknown> = { ...params.state };
++    delete sanitizedInput.users;
++    delete sanitizedInput.companies;
++    delete sanitizedInput.passwordHash;
++    delete sanitizedInput.passwordSalt;
++
++    const rawCompObj = (
++      (sanitizedInput.company && typeof sanitizedInput.company === 'object'
++        ? sanitizedInput.company
++        : {}) as Record<string, unknown>
++    );
++
++    if (params.targetMode === 'current_company') {
++      sanitizedInput.company = { ...rawCompObj, id: resolvedTargetCompanyId };
++      sanitizedInput.activeCompanyId = resolvedTargetCompanyId;
++      for (const key of TENANT_SCOPED_COLLECTIONS) {
++        const val = sanitizedInput[key];
++        if (!Array.isArray(val)) continue;
++        sanitizedInput[key] = val.map((item) =>
++          item && typeof item === 'object'
++            ? { ...(item as Record<string, unknown>), companyId: resolvedTargetCompanyId }
++            : item
++        );
++      }
++    } else {
++      // Preserve explicit foreign ID rejection if state.company.id contradicts targetCompanyId, while filling missing companyId on legacy rows
++      if (!rawCompObj.id) {
++        sanitizedInput.company = { ...rawCompObj, id: resolvedTargetCompanyId };
++      }
++      if (!sanitizedInput.activeCompanyId) {
++        sanitizedInput.activeCompanyId = resolvedTargetCompanyId;
++      }
++      for (const key of TENANT_SCOPED_COLLECTIONS) {
++        const val = sanitizedInput[key];
++        if (!Array.isArray(val)) continue;
++        sanitizedInput[key] = val.map((item) => {
++          if (!item || typeof item !== 'object') return item;
++          const rec = item as Record<string, unknown>;
++          if (rec.companyId === undefined || rec.companyId === null || String(rec.companyId).trim() === '') {
++            return { ...rec, companyId: resolvedTargetCompanyId };
++          }
++          return rec;
++        });
++      }
++    }
++
++    const validated = validateAndScopeStatePayload(sanitizedInput, resolvedTargetCompanyId);
++    if (!validated.ok) {
++      return {
++        ok: false,
++        status: 403,
++        code: 'TENANT_ISOLATION_VIOLATION',
++        error: validated.error,
++      };
++    }
++
++    const profileSource = {
++      ...rawCompObj,
++      ...(params.companyProfile || {}),
++    } as Partial<ServerCompanyRecord>;
++    const schemaVersion = String(validated.state.schemaVersion || '3.0.0');
++    const cleanNameAr = String(profileSource.nameAr || 'منشأة مستعادة').trim() || 'منشأة مستعادة';
++    const cleanNameEn = String(profileSource.nameEn || cleanNameAr).trim() || cleanNameAr;
++    const cleanCountryCode = String(profileSource.countryCode || 'YE').trim() || 'YE';
++    const cleanBaseCurrency = String(profileSource.baseCurrency || 'YER').trim() || 'YER';
++    const cleanValuation = String(profileSource.valuationPolicy || 'PER_ITEM').trim() || 'PER_ITEM';
++    const cleanCommercial = String(profileSource.commercialRecord || '');
++    const cleanTax = String(profileSource.taxNumber || '');
++    const cleanPhone = String(profileSource.phone || '');
++    const cleanEmail = String(profileSource.email || '');
++    const cleanAddress = String(profileSource.address || '');
++    const cleanFiscalStart = String(profileSource.fiscalYearStart || '2026-01-01');
++
++    return this.db.transaction(
++      async (tx) => {
++        const existingCompRes = await tx.query('SELECT * FROM companies WHERE id = $1 FOR UPDATE', [
++          resolvedTargetCompanyId,
++        ]);
++        const memRes = await tx.query<{ role: string; is_active: boolean }>(
++          'SELECT role, is_active FROM company_memberships WHERE user_id = $1 AND company_id = $2 LIMIT 1',
++          [params.actor.id, resolvedTargetCompanyId]
++        );
++
++        let savedCompany: ServerCompanyRecord;
++        let savedRevision = 1;
++        let savedLicense: ServerLicenseRecord;
++
++        if (existingCompRes.rows[0]) {
++          // Existing company: require active admin membership
++          const memRow = memRes.rows[0];
++          if (!memRow || !memRow.is_active) {
++            return {
++              ok: false,
++              status: 403,
++              code: 'TENANT_ISOLATION_VIOLATION',
++              error: `عزل المنشآت: لا تملك عضوية نشطة مصرح بها لاستعادة البيانات داخل المنشأة (${resolvedTargetCompanyId}).`,
++            };
++          }
++
++          const memRole = String(memRow.role || '');
++          const isAdminMem =
++            memRole === 'مالك المؤسسة' ||
++            memRole === 'مدير النظام' ||
++            memRole === 'Tenant Admin' ||
++            Boolean(params.actor.isSuperAdmin);
++          if (!isAdminMem) {
++            return {
++              ok: false,
++              status: 403,
++              code: 'FORBIDDEN_ROLE',
++              error: `صلاحية مرفوضة: الدور (${memRole || 'غير معروف'}) لا يملك صلاحية استعادة النسخ الاحتياطية.`,
++            };
++          }
++
++          if (params.targetMode === 'restored_company' && !params.allowReplaceExisting) {
++            return {
++              ok: false,
++              status: 409,
++              code: 'COMPANY_ALREADY_EXISTS',
++              error: `المنشأة (${resolvedTargetCompanyId}) موجودة مسبقاً في قاعدة البيانات. اختر تأكيد الاستبدال أو الاستعادة داخل المنشأة النشطة.`,
++            };
++          }
++
++          const stateRowRes = await tx.query<{ revision: number }>(
++            'SELECT revision FROM company_state WHERE company_id = $1 FOR UPDATE',
++            [resolvedTargetCompanyId]
++          );
++          const currentRevision = stateRowRes.rows[0] ? Number(stateRowRes.rows[0].revision) : 0;
++
++          if (
++            params.expectedRevision !== undefined &&
++            currentRevision > 0 &&
++            currentRevision > params.expectedRevision
++          ) {
++            return {
++              ok: false,
++              status: 409,
++              code: 'REVISION_CONFLICT',
++              serverRevision: currentRevision,
++              error: `تعارض تزامن البيانات: يوجد تحديث أحدث على الخادم (الإصدار ${currentRevision}). يرجى تحديث الصفحة والمحاولة مجدداً.`,
++            };
++          }
++
++          const updatedCompRes = await tx.query(
++            `
++            UPDATE companies
++            SET name_ar = COALESCE(NULLIF($2, ''), name_ar),
++                name_en = COALESCE(NULLIF($3, ''), name_en),
++                country_code = COALESCE(NULLIF($4, ''), country_code),
++                base_currency = COALESCE(NULLIF($5, ''), base_currency),
++                valuation_policy = COALESCE(NULLIF($6, ''), valuation_policy),
++                commercial_record = $7,
++                tax_number = $8,
++                phone = $9,
++                email = $10,
++                address = $11,
++                fiscal_year_start = COALESCE(NULLIF($12, ''), fiscal_year_start),
++                updated_at = NOW()
++            WHERE id = $1
++            RETURNING *
++          `,
++            [
++              resolvedTargetCompanyId,
++              cleanNameAr,
++              cleanNameEn,
++              cleanCountryCode,
++              cleanBaseCurrency,
++              cleanValuation,
++              cleanCommercial,
++              cleanTax,
++              cleanPhone,
++              cleanEmail,
++              cleanAddress,
++              cleanFiscalStart,
++            ]
++          );
++          savedCompany = mapCompanyRow(updatedCompRes.rows[0]);
++
++          await tx.query(
++            `
++            INSERT INTO company_licenses (company_id, license_mode, status, plan_code)
++            VALUES ($1, 'unrestricted', 'active', 'standard')
++            ON CONFLICT (company_id) DO NOTHING
++          `,
++            [resolvedTargetCompanyId]
++          );
++          const licRes = await tx.query('SELECT * FROM company_licenses WHERE company_id = $1 LIMIT 1', [
++            resolvedTargetCompanyId,
++          ]);
++          savedLicense = mapLicenseRow(licRes.rows[0], resolvedTargetCompanyId);
++
++          savedRevision = currentRevision + 1;
++          const profilePayload = {
++            ...savedCompany,
++            isActive: savedCompany.status !== 'inactive' && savedCompany.status !== 'suspended',
++          };
++          const finalState = {
++            ...validated.state,
++            schemaVersion,
++            company: profilePayload,
++            activeCompanyId: resolvedTargetCompanyId,
++          };
++
++          await tx.query(
++            `
++            INSERT INTO company_state (
++              company_id, schema_version, revision, company_profile, state_json, updated_by_user_id, updated_at
++            ) VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, NOW())
++            ON CONFLICT (company_id) DO UPDATE SET
++              schema_version = EXCLUDED.schema_version,
++              revision = EXCLUDED.revision,
++              company_profile = EXCLUDED.company_profile,
++              state_json = EXCLUDED.state_json,
++              updated_by_user_id = EXCLUDED.updated_by_user_id,
++              updated_at = NOW()
++          `,
++            [
++              resolvedTargetCompanyId,
++              schemaVersion,
++              savedRevision,
++              JSON.stringify(profilePayload),
++              JSON.stringify(finalState),
++              params.actor.id,
++            ]
++          );
++        } else {
++          // New company creation during restore: strictly Super Admin + restored_company mode
++          if (params.targetMode !== 'restored_company') {
++            return {
++              ok: false,
++              status: 404,
++              code: 'COMPANY_NOT_FOUND',
++              error: 'المنشأة النشطة غير موجودة في قاعدة البيانات.',
++            };
++          }
++          if (!params.actor.isSuperAdmin) {
++            return {
++              ok: false,
++              status: 403,
++              code: 'FORBIDDEN_SUPER_ADMIN_ONLY',
++              error: 'صلاحية مرفوضة: إنشاء مؤسسة مستقلة أثناء الاستعادة مخصص لمالك المؤسسة (Super Admin) فقط.',
++            };
++          }
++
++          const insertedCompRes = await tx.query(
++            `
++            INSERT INTO companies (
++              id, name_ar, name_en, country_code, base_currency, valuation_policy,
++              commercial_record, tax_number, phone, email, address, fiscal_year_start, status, created_by_user_id
++            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, 'active', $13)
++            RETURNING *
++          `,
++            [
++              resolvedTargetCompanyId,
++              cleanNameAr,
++              cleanNameEn,
++              cleanCountryCode,
++              cleanBaseCurrency,
++              cleanValuation,
++              cleanCommercial,
++              cleanTax,
++              cleanPhone,
++              cleanEmail,
++              cleanAddress,
++              cleanFiscalStart,
++              params.actor.id,
++            ]
++          );
++          savedCompany = mapCompanyRow(insertedCompRes.rows[0]);
++
++          const creatorRole =
++            params.actor.isSuperAdmin || params.actor.role === 'مالك المؤسسة'
++              ? params.actor.role
++              : 'Tenant Admin';
++          const adminFlags: ServerUserFlags = {
++            canViewReports: true,
++            canPostEntries: true,
++            canAdjustInventory: true,
++            canViewCostsAndProfits: true,
++            canManageSettings: true,
++            canEditInvoices: true,
++            canDeleteInvoices: true,
++            canEditVouchers: true,
++            canDeleteVouchers: true,
++            canEditExchangeRates: true,
++          };
++          const starterBranchId =
++            (Array.isArray(validated.state.branches) &&
++              (validated.state.branches as Array<{ id?: string; companyId?: string }>).find(
++                (b) => b.companyId === resolvedTargetCompanyId
++              )?.id) ||
++            `br-${resolvedTargetCompanyId}`;
++
++          await tx.query(
++            `
++            INSERT INTO company_memberships (
++              user_id, company_id, role, branch_id, permission_matrix, flags_json, is_active
++            ) VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, TRUE)
++          `,
++            [
++              params.actor.id,
++              resolvedTargetCompanyId,
++              creatorRole,
++              starterBranchId,
++              JSON.stringify({
++                '*': {
++                  view: true,
++                  create: true,
++                  edit: true,
++                  delete: true,
++                  post: true,
++                  approve: true,
++                  export: true,
++                  print: true,
++                  manageSettings: true,
++                  viewCosts: true,
++                },
++              }),
++              JSON.stringify(adminFlags),
++            ]
++          );
++
++          const licInsertRes = await tx.query(
++            `
++            INSERT INTO company_licenses (company_id, license_mode, status, plan_code)
++            VALUES ($1, 'unrestricted', 'active', 'standard')
++            RETURNING *
++          `,
++            [resolvedTargetCompanyId]
++          );
++          savedLicense = mapLicenseRow(licInsertRes.rows[0], resolvedTargetCompanyId);
++
++          savedRevision = 1;
++          const profilePayload = {
++            ...savedCompany,
++            isActive: true,
++          };
++          const finalState = {
++            ...validated.state,
++            schemaVersion,
++            company: profilePayload,
++            activeCompanyId: resolvedTargetCompanyId,
++          };
++
++          await tx.query(
++            `
++            INSERT INTO company_state (
++              company_id, schema_version, revision, company_profile, state_json, updated_by_user_id, updated_at
++            ) VALUES ($1, $2, $3, $4::jsonb, $5::jsonb, $6, NOW())
++          `,
++            [
++              resolvedTargetCompanyId,
++              schemaVersion,
++              savedRevision,
++              JSON.stringify(profilePayload),
++              JSON.stringify(finalState),
++              params.actor.id,
++            ]
++          );
++        }
++
++        const sourceNote = params.sourceLabel ? ` (${params.sourceLabel})` : '';
++        await tx.query(
++          `
++          INSERT INTO company_audit_logs (id, company_id, actor_user_id, actor_name, action, module, details, entity_id)
++          VALUES ($1, $2, $3, $4, 'استعادة', 'الإعدادات', $5, $2)
++        `,
++          [
++            `log-${crypto.randomUUID().slice(0, 10)}`,
++            resolvedTargetCompanyId,
++            params.actor.id,
++            params.actor.fullName,
++            `اعتماد استعادة وترحيل النسخة الاحتياطية للمنشأة (${savedCompany.nameAr})${sourceNote}`,
++          ]
++        );
++
++        await tx.query(
++          'UPDATE users SET company_id = COALESCE(company_id, $1), last_active_company_id = $1, updated_at = NOW() WHERE id = $2',
++          [resolvedTargetCompanyId, params.actor.id]
++        );
++
++        const allRes = await tx.query(
++          `
++          SELECT c.*
++          FROM companies c
++          INNER JOIN company_memberships m ON m.company_id = c.id
++          WHERE m.user_id = $1 AND m.is_active = TRUE
++          ORDER BY c.created_at ASC
++        `,
++          [params.actor.id]
++        );
++
++        return {
++          ok: true,
++          company: savedCompany,
++          companies: allRes.rows.map(mapCompanyRow),
++          activeCompanyId: resolvedTargetCompanyId,
++          revision: savedRevision,
++          license: savedLicense,
++        };
++      },
++      { companyId: resolvedTargetCompanyId, userId: params.actor.id }
++    );
++  }
++
+   async listCompanyUsers(
+     actorUserId: string,
+     companyId: string
+diff --git a/src/App.tsx b/src/App.tsx
+index 3342016..f034878 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -49,6 +49,7 @@ import { assertTenantAccess, isPlatformSuperAdmin } from './services/securitySer
+ import {
+   cloudApiService,
+   hydrateErpDatabaseFromServerState,
++  prepareDatabaseForRestore,
+   serverUserToErpUser,
+ } from './services/cloudApiService';
+ import {
+@@ -591,6 +592,14 @@ export default function App() {
+     }
+ 
+     const activeCid = db.activeCompanyId || db.company.id;
++    if (db.company?.id && db.company.id !== activeCid) {
++      notify(
++        'error',
++        `عزل المنشآت: تم منع حفظ بيانات (${db.company.id}) فوق المنشأة النشطة (${activeCid}).`
++      );
++      return;
++    }
++
+     cloudSaveTimerRef.current = setTimeout(async () => {
+       cloudSaveTimerRef.current = null;
+       const res = await cloudApiService.saveCompanyState(db, activeCid, cloudRevisionRef.current);
+@@ -598,7 +607,11 @@ export default function App() {
+         cloudRevisionRef.current = res.revision;
+       } else if (res.conflict) {
+         await hydrateWorkspaceFromCloud().catch(() => null);
+-        notify('info', 'تم تحديث البيانات من جلسة أحدث على الخادم.');
++        notify('info', 'تعارض تزامن (409): تم تحديث البيانات من جلسة أحدث على الخادم.');
++      } else if (res.status === 403 || res.code === 'TENANT_ISOLATION_VIOLATION' || res.code === 'FORBIDDEN_ROLE') {
++        notify('error', res.error || 'صلاحية مرفوضة (403): عزل المنشآت منع الكتابة فوق هذه المنشأة.');
++      } else {
++        notify('error', res.error || 'تعذر مزامنة البيانات مع الخادم.');
+       }
+     }, 450);
+ 
+@@ -1783,19 +1796,116 @@ export default function App() {
+             onToggleDocumentBook={handleToggleDocumentBook}
+             onSetDefaultDocumentBook={handleSetDefaultDocumentBook}
+             onResetDatabase={executeResetDatabase}
+-            onRestoreDatabase={(restored) => {
++            onRestoreDatabase={async (restored, options) => {
+               const check = validateDatabaseObject(restored);
+               if (!check.valid || !check.db) {
+-                notify('error', check.error || 'ملف النسخة المستعادة تالف أو غير مكتمل.');
+-                return;
++                const msg = check.error || 'ملف النسخة المستعادة تالف أو غير مكتمل.';
++                notify('error', msg);
++                return { ok: false, status: 400, code: 'INVALID_BACKUP_PAYLOAD', error: msg };
++              }
++
++              const currentActiveCid = db.activeCompanyId || db.company.id;
++              const restoredCid =
++                String(check.db.company?.id || check.db.activeCompanyId || currentActiveCid).trim() ||
++                currentActiveCid;
++              const targetMode: 'current_company' | 'restored_company' =
++                options?.targetMode ||
++                (isPlatformSuperAdmin(currentUser) && restoredCid !== currentActiveCid
++                  ? 'restored_company'
++                  : 'current_company');
++
++              if (targetMode === 'restored_company' && !isPlatformSuperAdmin(currentUser)) {
++                const msg =
++                  'صلاحية مرفوضة (403): إنشاء أو استعادة مؤسسة مستقلة مخصص لمالك المؤسسة (Super Admin) فقط.';
++                notify('error', msg);
++                return { ok: false, status: 403, code: 'FORBIDDEN_SUPER_ADMIN_ONLY', error: msg };
++              }
++
++              const targetCid = targetMode === 'current_company' ? currentActiveCid : restoredCid;
++
++              if (cloudSessionActive) {
++                if (cloudSaveTimerRef.current) {
++                  clearTimeout(cloudSaveTimerRef.current);
++                  cloudSaveTimerRef.current = null;
++                }
++
++                const res = await cloudApiService.restoreCompanyBackup({
++                  targetMode,
++                  targetCompanyId: targetCid,
++                  db: check.db,
++                  expectedRevision: targetMode === 'current_company' ? cloudRevisionRef.current : undefined,
++                  allowReplaceExisting: options?.allowReplaceExisting,
++                  sourceLabel: options?.sourceLabel,
++                });
++
++                if (!res.ok) {
++                  if (res.status === 409 && res.code === 'REVISION_CONFLICT') {
++                    notify(
++                      'error',
++                      res.error || 'تعارض تزامن البيانات (409): يوجد تحديث أحدث على الخادم.'
++                    );
++                  } else if (res.status === 409 && res.code === 'COMPANY_ALREADY_EXISTS') {
++                    notify(
++                      'error',
++                      res.error || 'المنشأة موجودة مسبقاً (409): يرجى تأكيد الاستبدال أو الاستعادة داخل المنشأة الحالية.'
++                    );
++                  } else if (res.status === 403) {
++                    notify(
++                      'error',
++                      res.error || 'صلاحية مرفوضة (403): عزل المنشآت منع اعتماد الاستعادة.'
++                    );
++                  } else {
++                    notify('error', res.error || 'تعذر اعتماد واستعادة النسخة الاحتياطية على الخادم.');
++                  }
++                  return {
++                    ok: false,
++                    status: res.status,
++                    code: res.code,
++                    error: res.error,
++                  };
++                }
++
++                const nextAllowedIds = res.companies.map((c) => c.id);
++                const { hydratedDb } = await hydrateWorkspaceFromCloud();
++                const matchedServerUser = hydratedDb.users.find(
++                  (u) => u.id === currentUser.id && u.active
++                );
++                setCurrentUser((prev) => ({
++                  ...(matchedServerUser || prev),
++                  allowedCompanyIds: nextAllowedIds.length > 0 ? nextAllowedIds : prev.allowedCompanyIds,
++                }));
++                notify(
++                  'success',
++                  `تم اعتماد وحفظ استعادة (${hydratedDb.company.nameAr}) في قاعدة البيانات بنجاح.`
++                );
++                return { ok: true };
+               }
+-              const safeDb = check.db;
+-              setDb(safeDb);
+-              const restoredScoped = scopeDatabaseToCompany(safeDb);
++
++              // Offline / Local-only fallback
++              const preparedLocal = prepareDatabaseForRestore(check.db, targetCid, targetMode);
++              const localCompanies =
++                targetMode === 'current_company'
++                  ? (db.companies || [preparedLocal.company]).map((c) =>
++                      c.id === targetCid ? preparedLocal.company : c
++                    )
++                  : [
++                      ...(db.companies || []).filter((c) => c.id !== preparedLocal.company.id),
++                      preparedLocal.company,
++                    ];
++              const finalLocalDb: ERPDatabase = {
++                ...preparedLocal,
++                companies: localCompanies,
++                users: check.db.users && check.db.users.length > 0 ? check.db.users : db.users,
++              };
++              setDb(finalLocalDb);
++              const restoredScoped = scopeDatabaseToCompany(finalLocalDb, targetCid);
+               if (restoredScoped.branches[0]) setCurrentBranch(restoredScoped.branches[0]);
+-              const baseCurr = safeDb.currencies.find((c) => c.isBase) || safeDb.currencies[0];
++              const baseCurr =
++                finalLocalDb.currencies.find((c) => c.code === finalLocalDb.company.baseCurrency) ||
++                finalLocalDb.currencies.find((c) => c.isBase) ||
++                finalLocalDb.currencies[0];
+               if (baseCurr) setCurrentCurrency(baseCurr);
+-              const matchedUser = safeDb.users.find((u) => u.id === currentUser.id && u.active);
++              const matchedUser = finalLocalDb.users.find((u) => u.id === currentUser.id && u.active);
+               if (matchedUser) {
+                 setCurrentUser(matchedUser);
+               } else {
+@@ -1803,6 +1913,8 @@ export default function App() {
+                 setAuthCanCancel(false);
+                 setAuthModalMode('login');
+               }
++              notify('success', `تمت استعادة بيانات (${finalLocalDb.company.nameAr}) بنجاح.`);
++              return { ok: true };
+             }}
+             onUpdateDatabase={setDb}
+             onNotify={notify}
+diff --git a/src/components/common/ConfirmModal.tsx b/src/components/common/ConfirmModal.tsx
+index b0471bc..45c02f8 100644
+--- a/src/components/common/ConfirmModal.tsx
++++ b/src/components/common/ConfirmModal.tsx
+@@ -14,6 +14,8 @@ interface ConfirmModalProps {
+   confirmLabel?: string;
+   cancelLabel?: string;
+   variant?: 'danger' | 'warning';
++  isLoading?: boolean;
++  children?: React.ReactNode;
+   onConfirm: () => void;
+   onCancel: () => void;
+ }
+@@ -25,6 +27,8 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
+   confirmLabel = 'تأكيد التنفيذ',
+   cancelLabel = 'تراجع',
+   variant = 'warning',
++  isLoading = false,
++  children,
+   onConfirm,
+   onCancel,
+ }) => {
+@@ -46,33 +50,39 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
+           </div>
+           <button
+             type="button"
++            disabled={isLoading}
+             onClick={onCancel}
+-            className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800"
++            className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-50"
+           >
+             <X className="w-4 h-4" />
+           </button>
+         </div>
+ 
+-        <div className="p-5 text-xs sm:text-sm text-slate-300 leading-relaxed">{message}</div>
++        <div className="p-5 space-y-3 text-xs sm:text-sm text-slate-300 leading-relaxed">
++          <p>{message}</p>
++          {children}
++        </div>
+ 
+         <div className="flex items-center justify-end gap-2.5 px-5 py-3.5 border-t border-slate-800 bg-slate-950/60">
+           <button
+             type="button"
++            disabled={isLoading}
+             onClick={onCancel}
+-            className="px-4 py-2 rounded-lg text-xs font-semibold text-slate-300 hover:bg-slate-800 border border-slate-700"
++            className="px-4 py-2 rounded-lg text-xs font-semibold text-slate-300 hover:bg-slate-800 border border-slate-700 disabled:opacity-50"
+           >
+             {cancelLabel}
+           </button>
+           <button
+             type="button"
++            disabled={isLoading}
+             onClick={onConfirm}
+-            className={`px-4 py-2 rounded-lg text-xs font-bold ${
++            className={`px-4 py-2 rounded-lg text-xs font-bold disabled:opacity-60 ${
+               variant === 'danger'
+                 ? 'bg-rose-600 hover:bg-rose-500 text-white'
+                 : 'bg-amber-500 hover:bg-amber-400 text-slate-950'
+             }`}
+           >
+-            {confirmLabel}
++            {isLoading ? 'جاري التنفيذ والاعتماد...' : confirmLabel}
+           </button>
+         </div>
+       </div>
+diff --git a/src/components/modules/settings/DataMigrationPanel.tsx b/src/components/modules/settings/DataMigrationPanel.tsx
+index 76687fd..5d0cb56 100644
+--- a/src/components/modules/settings/DataMigrationPanel.tsx
++++ b/src/components/modules/settings/DataMigrationPanel.tsx
+@@ -28,8 +28,10 @@ import {
+   Customer,
+   InventoryItem,
+   ItemWarehouseStock,
++  User,
+   Vendor,
+ } from '../../../types/erp';
++import { isPlatformSuperAdmin } from '../../../services/securityService';
+ import { exportToExcel } from '../../../services/exportService';
+ import {
+   ParsedBakDatabase,
+@@ -40,9 +42,26 @@ import {
+ type MigrationTarget = 'customers' | 'vendors' | 'inventory' | 'accounts';
+ type ImportMode = 'merge' | 'replace';
+ 
++export interface MigrationApplyOptions {
++  targetMode?: 'current_company' | 'restored_company';
++  allowReplaceExisting?: boolean;
++  sourceLabel?: string;
++}
++
++export interface MigrationApplyResult {
++  ok: boolean;
++  error?: string;
++  code?: string;
++  status?: number;
++}
++
+ interface DataMigrationPanelProps {
+   db: ERPDatabase;
+-  onApplyMigration: (updatedDb: ERPDatabase) => void;
++  currentUser?: User;
++  onApplyMigration: (
++    updatedDb: ERPDatabase,
++    options?: MigrationApplyOptions
++  ) => Promise<MigrationApplyResult | void> | void;
+ }
+ 
+ const TARGET_LABELS: Record<MigrationTarget, string> = {
+@@ -81,8 +100,11 @@ function toNum(val: any, fallback = 0): number {
+ 
+ export const DataMigrationPanel: React.FC<DataMigrationPanelProps> = ({
+   db,
++  currentUser,
+   onApplyMigration,
+ }) => {
++  const isSuperAdmin = currentUser ? isPlatformSuperAdmin(currentUser) : false;
++
+   // Excel / CSV state
+   const [target, setTarget] = useState<MigrationTarget>('customers');
+   const [importMode, setImportMode] = useState<ImportMode>('merge');
+@@ -101,6 +123,12 @@ export const DataMigrationPanel: React.FC<DataMigrationPanelProps> = ({
+   const [bakMode, setBakMode] = useState<ImportMode>('replace');
+   const [includeCompany, setIncludeCompany] = useState(true);
+   const [includeRecentInvoices, setIncludeRecentInvoices] = useState(true);
++  const [bakRestoreMode, setBakRestoreMode] = useState<'current_company' | 'restored_company'>(() =>
++    isSuperAdmin ? 'restored_company' : 'current_company'
++  );
++  const [bakAllowReplace, setBakAllowReplace] = useState(false);
++  const [bakCommitting, setBakCommitting] = useState(false);
++  const [bakNeedsReplaceConfirm, setBakNeedsReplaceConfirm] = useState(false);
+   const [selectedBakTable, setSelectedBakTable] = useState<string>('');
+   const [bakTableRows, setBakTableRows] = useState<Record<string, any>[]>([]);
+ 
+@@ -151,20 +179,49 @@ export const DataMigrationPanel: React.FC<DataMigrationPanelProps> = ({
+     setBakTableRows(bakDb.decodeTable(tableName, 15));
+   };
+ 
+-  const handleCommitBakMigration = () => {
+-    if (!bakDb) return;
+-    const { updatedDb, stats } = bakDb.applyQrightMigration(db, bakMode, {
+-      includeCompany,
+-      includeRecentInvoices,
+-    });
+-    onApplyMigration(updatedDb);
+-    setSuccessMsg(
+-      `تم ترحيل البيانات بنجاح إلى نظام المنصور ERP: (${stats.accountsImported} حساب، ${stats.customersImported} عميل، ${stats.vendorsImported} مورد، ${stats.itemsImported} صنف، ${stats.stockRowsImported} رصيد مستودع، ${stats.warehousesImported} مستودع${
+-        stats.invoicesImported > 0 || stats.vouchersImported > 0 || stats.journalEntriesImported > 0
+-          ? `، ${stats.invoicesImported} فاتورة، ${stats.vouchersImported} سند، ${stats.journalEntriesImported} قيد يومية`
+-          : ''
+-      }).`
+-    );
++  const handleCommitBakMigration = async () => {
++    if (!bakDb || bakCommitting) return;
++    setErrorMsg('');
++    setSuccessMsg('');
++    setBakCommitting(true);
++    try {
++      const effectiveTargetMode: 'current_company' | 'restored_company' =
++        bakMode === 'merge' || !isSuperAdmin ? 'current_company' : bakRestoreMode;
++      const currentCid = db.activeCompanyId || db.company.id;
++      const { updatedDb, stats } = bakDb.applyQrightMigration(db, bakMode, {
++        includeCompany,
++        includeRecentInvoices,
++        targetCompanyId: effectiveTargetMode === 'current_company' ? currentCid : undefined,
++      });
++
++      const res = await onApplyMigration(updatedDb, {
++        targetMode: effectiveTargetMode,
++        allowReplaceExisting: bakAllowReplace,
++        sourceLabel: bakDb.databaseName,
++      });
++
++      if (res && !res.ok) {
++        if (res.code === 'COMPANY_ALREADY_EXISTS' || res.status === 409) {
++          setBakNeedsReplaceConfirm(true);
++        }
++        setErrorMsg(res.error || 'تعذر اعتماد ترحيل النسخة الاحتياطية على الخادم.');
++        return;
++      }
++
++      setBakNeedsReplaceConfirm(false);
++      setBakAllowReplace(false);
++      setSuccessMsg(
++        `تم ترحيل البيانات بنجاح إلى نظام المنصور ERP: (${stats.accountsImported} حساب، ${stats.customersImported} عميل، ${stats.vendorsImported} مورد، ${stats.itemsImported} صنف، ${stats.stockRowsImported} رصيد مستودع، ${stats.warehousesImported} مستودع${
++          stats.invoicesImported > 0 || stats.vouchersImported > 0 || stats.journalEntriesImported > 0
++            ? `، ${stats.invoicesImported} فاتورة، ${stats.vouchersImported} سند، ${stats.journalEntriesImported} قيد يومية`
++            : ''
++        }).`
++      );
++    } catch (err) {
++      setErrorMsg(err instanceof Error ? err.message : 'تعذر إتمام عملية الترحيل.');
++    } finally {
++      setBakCommitting(false);
++    }
+   };
+ 
+   const handleExcelCsvFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
+@@ -202,8 +259,10 @@ export const DataMigrationPanel: React.FC<DataMigrationPanelProps> = ({
+     }
+   };
+ 
+-  const handleCommitExcelImport = () => {
++  const handleCommitExcelImport = async () => {
+     if (parsedRows.length === 0) return;
++    setErrorMsg('');
++    setSuccessMsg('');
+ 
+     const now = new Date().toISOString();
+     const today = now.split('T')[0];
+@@ -542,18 +601,25 @@ export const DataMigrationPanel: React.FC<DataMigrationPanelProps> = ({
+       ...db.auditLogs,
+     ];
+ 
++    const applyRes = await onApplyMigration(updatedDb, {
++      targetMode: 'current_company',
++      sourceLabel: fileName || 'excel-import',
++    });
++    if (applyRes && !applyRes.ok) {
++      setErrorMsg(applyRes.error || 'تعذر حفظ البيانات المستوردة على الخادم.');
++      return;
++    }
+     setRollbackSnapshot({
+       db: preImportDbSnapshot,
+       logId: importLogId,
+       label: `${TARGET_LABELS[target]} (${importedCount} سجل)`,
+     });
+-    onApplyMigration(updatedDb);
+     setSuccessMsg(`تم استيراد وترحيل ${importedCount} سجل بنجاح (تم تخطي ${skippedDuplicates} مكرر) إلى (${TARGET_LABELS[target]}).`);
+     setParsedRows([]);
+     setFileName('');
+   };
+ 
+-  const handleRollbackLastImport = () => {
++  const handleRollbackLastImport = async () => {
+     if (!rollbackSnapshot) return;
+     const rolledDb: ERPDatabase = {
+       ...rollbackSnapshot.db,
+@@ -561,7 +627,14 @@ export const DataMigrationPanel: React.FC<DataMigrationPanelProps> = ({
+         l.id === rollbackSnapshot.logId ? { ...l, status: 'rolled_back' as const } : l
+       ),
+     };
+-    onApplyMigration(rolledDb);
++    const res = await onApplyMigration(rolledDb, {
++      targetMode: 'current_company',
++      sourceLabel: `rollback-${rollbackSnapshot.logId}`,
++    });
++    if (res && !res.ok) {
++      setErrorMsg(res.error || 'تعذر التراجع عن الاستيراد على الخادم.');
++      return;
++    }
+     setSuccessMsg(`تم التراجع الذري (Rollback) عن عملية استيراد: ${rollbackSnapshot.label}.`);
+     setRollbackSnapshot(null);
+   };
+@@ -761,14 +834,59 @@ SELECT * FROM StoresInventory;
+                     <div className="flex justify-end">
+                       <button
+                         type="button"
+-                        onClick={handleCommitBakMigration}
+-                        className="w-full py-2.5 px-4 bg-amber-500 hover:bg-amber-600 text-slate-950 font-black rounded-xl flex items-center justify-center gap-2 transition-colors cursor-pointer shadow-md"
++                        disabled={bakCommitting}
++                        onClick={() => void handleCommitBakMigration()}
++                        className="w-full py-2.5 px-4 bg-amber-500 hover:bg-amber-600 disabled:opacity-60 text-slate-950 font-black rounded-xl flex items-center justify-center gap-2 transition-colors cursor-pointer shadow-md"
+                       >
+-                        <RefreshCw className="w-4 h-4" />
+-                        <span>ترحيل البيانات إلى نظام المنصور ERP</span>
++                        <RefreshCw className={`w-4 h-4 ${bakCommitting ? 'animate-spin' : ''}`} />
++                        <span>{bakCommitting ? 'جاري الاعتماد والحفظ في قاعدة البيانات...' : 'ترحيل البيانات إلى نظام المنصور ERP'}</span>
+                       </button>
+                     </div>
+                   </div>
++
++                  {isSuperAdmin && bakMode === 'replace' && (
++                    <div className="pt-2 border-t border-slate-800/80 flex flex-wrap items-center gap-4 text-[11px] text-slate-300">
++                      <span className="font-bold text-amber-300">وجهة الاستعادة:</span>
++                      <label className="flex items-center gap-1.5 cursor-pointer">
++                        <input
++                          type="radio"
++                          name="bakRestoreMode"
++                          checked={bakRestoreMode === 'restored_company'}
++                          onChange={() => {
++                            setBakRestoreMode('restored_company');
++                            setBakNeedsReplaceConfirm(false);
++                          }}
++                          className="accent-amber-500"
++                        />
++                        <span>إنشاء / ربط كمؤسسة مستقلة بمعرفها (comp-bak-1)</span>
++                      </label>
++                      <label className="flex items-center gap-1.5 cursor-pointer">
++                        <input
++                          type="radio"
++                          name="bakRestoreMode"
++                          checked={bakRestoreMode === 'current_company'}
++                          onChange={() => {
++                            setBakRestoreMode('current_company');
++                            setBakNeedsReplaceConfirm(false);
++                            setBakAllowReplace(false);
++                          }}
++                          className="accent-amber-500"
++                        />
++                        <span>الاستعادة داخل المؤسسة النشطة الحالية ({db.company.nameAr})</span>
++                      </label>
++                      {bakNeedsReplaceConfirm && bakRestoreMode === 'restored_company' && (
++                        <label className="flex items-center gap-1.5 cursor-pointer text-amber-300 font-bold">
++                          <input
++                            type="checkbox"
++                            checked={bakAllowReplace}
++                            onChange={(e) => setBakAllowReplace(e.target.checked)}
++                            className="accent-amber-500"
++                          />
++                          <span>تأكيد استبدال بيانات المؤسسة المستقلة المسجلة مسبقاً</span>
++                        </label>
++                      )}
++                    </div>
++                  )}
+                 </div>
+               )}
+ 
+diff --git a/src/components/modules/settings/SettingsModule.tsx b/src/components/modules/settings/SettingsModule.tsx
+index 0b76882..f20aaa5 100644
+--- a/src/components/modules/settings/SettingsModule.tsx
++++ b/src/components/modules/settings/SettingsModule.tsx
+@@ -43,6 +43,7 @@ import {
+ } from '../../../services/storageService';
+ import {
+   getRoleDisplayLabel,
++  isPlatformSuperAdmin,
+   isTenantAdminUser,
+   validateUploadFile,
+ } from '../../../services/securityService';
+@@ -66,7 +67,14 @@ interface SettingsModuleProps {
+   onUpdateCurrencies: (currencies: Currency[]) => void;
+   onUpdateUserPermissions?: (user: User) => void;
+   onResetDatabase: () => void;
+-  onRestoreDatabase: (db: ERPDatabase) => void;
++  onRestoreDatabase: (
++    db: ERPDatabase,
++    options?: {
++      targetMode?: 'current_company' | 'restored_company';
++      allowReplaceExisting?: boolean;
++      sourceLabel?: string;
++    }
++  ) => Promise<{ ok: boolean; error?: string; code?: string; status?: number } | void> | void;
+   onUpdateDatabase?: (db: ERPDatabase) => void;
+   onNotify?: (type: 'success' | 'error' | 'info', msg: string) => void;
+ }
+@@ -106,6 +114,7 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
+   onNotify,
+ }) => {
+   const canManage = isTenantAdminUser(currentUser);
++  const isSuperAdmin = isPlatformSuperAdmin(currentUser);
+   const tenantScopedDb = useMemo(() => filterDatabaseForUserTenants(db, currentUser), [db, currentUser]);
+   const activeCompanyScopedDb = useMemo(() => scopeDatabaseToCompany(tenantScopedDb), [tenantScopedDb]);
+ 
+@@ -205,6 +214,11 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
+     fileName: string;
+     stats: NonNullable<ReturnType<typeof validateBackupPayload>['stats']>;
+   } | null>(null);
++  const [restoreTargetMode, setRestoreTargetMode] = useState<'current_company' | 'restored_company'>('current_company');
++  const [allowReplaceExisting, setAllowReplaceExisting] = useState(false);
++  const [isCommittingRestore, setIsCommittingRestore] = useState(false);
++  const [restoreErrorMsg, setRestoreErrorMsg] = useState('');
++  const [restoreErrorCode, setRestoreErrorCode] = useState('');
+   const [isResetModalOpen, setIsResetModalOpen] = useState(false);
+ 
+   const requireAdmin = () => {
+@@ -381,6 +395,15 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
+         onNotify?.('error', check.error || 'ملف النسخة الاحتياطية غير صالح.');
+         return;
+       }
++      const activeCid = db.activeCompanyId || db.company.id;
++      setRestoreTargetMode(
++        isSuperAdmin && check.db.company.id && check.db.company.id !== activeCid
++          ? 'restored_company'
++          : 'current_company'
++      );
++      setAllowReplaceExisting(false);
++      setRestoreErrorMsg('');
++      setRestoreErrorCode('');
+       setPendingRestore({ db: check.db, fileName: file.name, stats: check.stats });
+     } finally {
+       setIsParsingRestore(false);
+@@ -398,8 +421,17 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
+         return;
+       }
+       const fileName = pendingEncryptedRaw.fileName;
++      const activeCid = db.activeCompanyId || db.company.id;
+       setPendingEncryptedRaw(null);
+       setDecryptPassphrase('');
++      setRestoreTargetMode(
++        isSuperAdmin && check.db.company.id && check.db.company.id !== activeCid
++          ? 'restored_company'
++          : 'current_company'
++      );
++      setAllowReplaceExisting(false);
++      setRestoreErrorMsg('');
++      setRestoreErrorCode('');
+       setPendingRestore({ db: check.db, fileName, stats: check.stats });
+     } catch {
+       onNotify?.('error', 'كلمة مرور فك التشفير غير صحيحة أو الملف تالف.');
+@@ -1619,10 +1651,23 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
+         <div className="max-w-5xl">
+           <DataMigrationPanel
+             db={db}
+-            onApplyMigration={(updated) => {
+-              if (!requireAdmin()) return;
+-              onRestoreDatabase(updated);
+-              onNotify?.('success', 'تم تطبيق وترحيل البيانات المستوردة بنجاح.');
++            currentUser={currentUser}
++            onApplyMigration={async (updated, migrationOptions) => {
++              if (!requireAdmin()) {
++                return {
++                  ok: false,
++                  status: 403,
++                  error: 'عذراً، صلاحيات حسابك الحالي لا تسمح بتعديل إعدادات النظام.',
++                };
++              }
++              const res = await onRestoreDatabase(updated, migrationOptions);
++              if (res && !res.ok) {
++                return res;
++              }
++              if (!res) {
++                onNotify?.('success', 'تم تطبيق وترحيل البيانات المستوردة بنجاح.');
++              }
++              return res;
+             }}
+           />
+         </div>
+@@ -1633,21 +1678,113 @@ export const SettingsModule: React.FC<SettingsModuleProps> = ({
+         isOpen={Boolean(pendingRestore)}
+         title="تأكيد استعادة النسخة الاحتياطية"
+         variant="warning"
++        isLoading={isCommittingRestore}
+         message={
+           pendingRestore
+-            ? `تم التحقق من سلامة الملف (${pendingRestore.fileName}): يحتوي على ${pendingRestore.stats.accounts} حساب، ${pendingRestore.stats.invoices} فاتورة، ${pendingRestore.stats.vouchers} سند، ${pendingRestore.stats.customers} عميل، ${pendingRestore.stats.items} صنف، ${pendingRestore.stats.journalEntries} قيد يومية. هل تريد استبدال قاعدة البيانات الحالية بهذه النسخة؟`
++            ? `تم التحقق من سلامة الملف (${pendingRestore.fileName}): يحتوي على ${pendingRestore.stats.accounts} حساب، ${pendingRestore.stats.invoices} فاتورة، ${pendingRestore.stats.vouchers} سند، ${pendingRestore.stats.customers} عميل، ${pendingRestore.stats.items} صنف، ${pendingRestore.stats.journalEntries} قيد يومية.`
+             : ''
+         }
+         confirmLabel="اعتماد الاستعادة الآن"
+-        onConfirm={() => {
+-          if (pendingRestore) {
+-            onRestoreDatabase(pendingRestore.db);
+-            onNotify?.('success', 'تمت استعادة قاعدة البيانات بنجاح.');
++        onConfirm={async () => {
++          if (!pendingRestore || isCommittingRestore) return;
++          setIsCommittingRestore(true);
++          setRestoreErrorMsg('');
++          try {
++            const res = await onRestoreDatabase(pendingRestore.db, {
++              targetMode: restoreTargetMode,
++              allowReplaceExisting,
++              sourceLabel: pendingRestore.fileName,
++            });
++            if (res && !res.ok) {
++              setRestoreErrorMsg(res.error || 'تعذر اعتماد الاستعادة في قاعدة البيانات.');
++              setRestoreErrorCode(res.code || '');
++              return;
++            }
++            if (!res) {
++              onNotify?.('success', 'تمت استعادة قاعدة البيانات بنجاح.');
++            }
++            setPendingRestore(null);
++            setAllowReplaceExisting(false);
++            setRestoreErrorMsg('');
++            setRestoreErrorCode('');
++          } finally {
++            setIsCommittingRestore(false);
+           }
++        }}
++        onCancel={() => {
+           setPendingRestore(null);
++          setAllowReplaceExisting(false);
++          setRestoreErrorMsg('');
++          setRestoreErrorCode('');
+         }}
+-        onCancel={() => setPendingRestore(null)}
+-      />
++      >
++        {pendingRestore && (
++          <div className="space-y-2.5 text-xs">
++            {isSuperAdmin ? (
++              <div className="bg-slate-950 border border-slate-800 rounded-lg p-3 space-y-2">
++                <div className="font-bold text-amber-300">نطاق الاستعادة والربط في قاعدة البيانات:</div>
++                <label className="flex items-start gap-2 cursor-pointer text-slate-200">
++                  <input
++                    type="radio"
++                    name="backupRestoreMode"
++                    checked={restoreTargetMode === 'current_company'}
++                    onChange={() => {
++                      setRestoreTargetMode('current_company');
++                      setAllowReplaceExisting(false);
++                      setRestoreErrorMsg('');
++                      setRestoreErrorCode('');
++                    }}
++                    className="mt-0.5 accent-amber-500"
++                  />
++                  <span>
++                    الاستعادة داخل المنشأة النشطة الحالية (<strong>{db.company.nameAr}</strong>)
++                  </span>
++                </label>
++                <label className="flex items-start gap-2 cursor-pointer text-slate-200">
++                  <input
++                    type="radio"
++                    name="backupRestoreMode"
++                    checked={restoreTargetMode === 'restored_company'}
++                    onChange={() => {
++                      setRestoreTargetMode('restored_company');
++                      setRestoreErrorMsg('');
++                      setRestoreErrorCode('');
++                    }}
++                    className="mt-0.5 accent-amber-500"
++                  />
++                  <span>
++                    الاستعادة كمؤسسة مستقلة بمعرف النسخة (
++                    <strong className="font-mono text-amber-300">{pendingRestore.db.company.id}</strong> —{' '}
++                    {pendingRestore.db.company.nameAr})
++                  </span>
++                </label>
++              </div>
++            ) : (
++              <div className="bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-[11px] text-slate-300">
++                سيتم اعتماد الاستعادة داخل منشأتك النشطة (<strong>{db.company.nameAr}</strong>).
++              </div>
++            )}
++
++            {restoreErrorMsg && (
++              <div className="bg-rose-950/40 border border-rose-700/60 text-rose-200 rounded-lg p-2.5 text-[11px] space-y-2">
++                <div>{restoreErrorMsg}</div>
++                {restoreTargetMode === 'restored_company' &&
++                  restoreErrorCode === 'COMPANY_ALREADY_EXISTS' && (
++                    <label className="flex items-center gap-2 cursor-pointer text-amber-300 font-bold">
++                      <input
++                        type="checkbox"
++                        checked={allowReplaceExisting}
++                        onChange={(e) => setAllowReplaceExisting(e.target.checked)}
++                        className="accent-amber-500"
++                      />
++                      <span>تأكيد استبدال بيانات المؤسسة المسجلة مسبقاً ({pendingRestore.db.company.id})</span>
++                    </label>
++                  )}
++              </div>
++            )}
++          </div>
++        )}
++      </ConfirmModal>
+ 
+       {/* Reset confirmation */}
+       <ConfirmModal
+diff --git a/src/components/modules/workbenches/SettingsWorkbench.tsx b/src/components/modules/workbenches/SettingsWorkbench.tsx
+index 4dcbbee..4ac19a5 100644
+--- a/src/components/modules/workbenches/SettingsWorkbench.tsx
++++ b/src/components/modules/workbenches/SettingsWorkbench.tsx
+@@ -82,7 +82,14 @@ interface SettingsWorkbenchProps {
+   onToggleDocumentBook: (bookId: string) => void;
+   onSetDefaultDocumentBook: (bookId: string) => void;
+   onResetDatabase: () => void;
+-  onRestoreDatabase: (restored: ERPDatabase) => void;
++  onRestoreDatabase: (
++    restored: ERPDatabase,
++    options?: {
++      targetMode?: 'current_company' | 'restored_company';
++      allowReplaceExisting?: boolean;
++      sourceLabel?: string;
++    }
++  ) => Promise<{ ok: boolean; error?: string; code?: string; status?: number } | void> | void;
+   onUpdateDatabase?: (nextDb: ERPDatabase) => void;
+   onNotify: (type: 'success' | 'error' | 'info', msg: string) => void;
+ }
+diff --git a/src/services/cloudApiService.ts b/src/services/cloudApiService.ts
+index 0db7b2e..c8e5e1a 100644
+--- a/src/services/cloudApiService.ts
++++ b/src/services/cloudApiService.ts
+@@ -324,6 +324,90 @@ export function hydrateErpDatabaseFromServerState(
+   return scopeDatabaseToCompany(migrateDatabase(cleanPayload), companyId);
+ }
+ 
++const RESTORE_SCOPED_COLLECTIONS = [
++  'branches',
++  'warehouses',
++  'departments',
++  'customers',
++  'vendors',
++  'inventoryItems',
++  'warehouseStock',
++  'stockCostLayers',
++  'inventoryBatches',
++  'storageLocations',
++  'stockMovements',
++  'inventoryTransfers',
++  'stocktakings',
++  'warehouseDocuments',
++  'documentBooks',
++  'chartOfAccounts',
++  'costCenters',
++  'journalEntries',
++  'fiscalPeriods',
++  'invoices',
++  'commercialOrders',
++  'treasuryAccounts',
++  'paymentVouchers',
++  'treasuryTransfers',
++  'bankReconciliations',
++  'posShifts',
++  'heldPosCarts',
++  'expenseCategories',
++  'expenseRecords',
++  'employees',
++  'payrollRuns',
++  'fixedAssets',
++  'customBooks',
++  'customBookEntries',
++  'approvalRules',
++  'approvalRequests',
++  'fxRevaluations',
++  'savedReportDesigns',
++  'auditLogs',
++  'taskAlerts',
++  'dispatchLogs',
++] as const;
++
++export function prepareDatabaseForRestore(
++  db: ERPDatabase,
++  targetCompanyId: string,
++  targetMode: 'current_company' | 'restored_company'
++): ERPDatabase {
++  const cleanCid = String(targetCompanyId || db.activeCompanyId || db.company.id).trim();
++  const next: Record<string, unknown> = { ...db };
++
++  for (const key of RESTORE_SCOPED_COLLECTIONS) {
++    const arr = next[key];
++    if (!Array.isArray(arr)) continue;
++    next[key] = arr.map((item) => {
++      if (!item || typeof item !== 'object') return item;
++      const rec = item as Record<string, unknown>;
++      if (
++        targetMode === 'current_company' ||
++        rec.companyId === undefined ||
++        rec.companyId === null ||
++        String(rec.companyId).trim() === ''
++      ) {
++        return { ...rec, companyId: cleanCid };
++      }
++      return rec;
++    });
++  }
++
++  const nextCompany: Company = {
++    ...db.company,
++    id: cleanCid,
++    isActive: db.company.isActive !== false,
++  };
++
++  return {
++    ...(next as unknown as ERPDatabase),
++    company: nextCompany,
++    activeCompanyId: cleanCid,
++    companies: [nextCompany],
++  };
++}
++
+ export function extractScopedCloudStatePayload(db: ERPDatabase, companyId: string): Record<string, unknown> {
+   const scoped = scopeDatabaseToCompany(db, companyId);
+   const { users: _u, companies: _c, ...rest } = scoped;
+@@ -562,12 +646,18 @@ export const cloudApiService = {
+     db: ERPDatabase,
+     companyId: string,
+     expectedRevision?: number
+-  ): Promise<{ ok: true; revision: number } | { ok: false; conflict?: boolean; error: string; serverRevision?: number }> {
++  ): Promise<
++    | { ok: true; revision: number }
++    | { ok: false; status?: number; code?: string; conflict?: boolean; error: string; serverRevision?: number }
++  > {
+     const payloadState = extractScopedCloudStatePayload(db, companyId);
+     const res = await fetch('/api/company/state', {
+       method: 'PUT',
+       credentials: 'include',
+-      headers: { 'Content-Type': 'application/json' },
++      headers: {
++        'Content-Type': 'application/json',
++        'X-Company-Id': companyId,
++      },
+       body: JSON.stringify({
+         companyId,
+         expectedRevision,
+@@ -578,6 +668,8 @@ export const cloudApiService = {
+     if (!res.ok) {
+       return {
+         ok: false,
++        status: res.status,
++        code: data.code,
+         conflict: res.status === 409,
+         serverRevision: data.serverRevision,
+         error: data.error || 'تعذر حفظ بيانات المنشأة في الخادم.',
+@@ -586,6 +678,102 @@ export const cloudApiService = {
+     return { ok: true, revision: data.revision || (expectedRevision ?? 0) + 1 };
+   },
+ 
++  async restoreCompanyBackup(params: {
++    targetMode: 'current_company' | 'restored_company';
++    targetCompanyId?: string;
++    db: ERPDatabase;
++    expectedRevision?: number;
++    allowReplaceExisting?: boolean;
++    sourceLabel?: string;
++  }): Promise<
++    | {
++        ok: true;
++        company: ServerCompanyDto;
++        companies: ServerCompanyDto[];
++        activeCompanyId: string;
++        revision: number;
++        licenseBoundary?: LicenseEvaluationResult;
++      }
++    | {
++        ok: false;
++        status: number;
++        code?: string;
++        conflict?: boolean;
++        serverRevision?: number;
++        error: string;
++      }
++  > {
++    const targetCid = String(
++      params.targetCompanyId || params.db.company?.id || params.db.activeCompanyId || ''
++    ).trim();
++    const prepared = prepareDatabaseForRestore(params.db, targetCid, params.targetMode);
++    const { users: _u, companies: _c, ...statePayload } = prepared;
++    const companyProfile = {
++      id: targetCid,
++      nameAr: prepared.company.nameAr,
++      nameEn: prepared.company.nameEn || prepared.company.nameAr,
++      countryCode: prepared.company.countryCode || 'YE',
++      baseCurrency: prepared.company.baseCurrency || 'YER',
++      valuationPolicy: prepared.company.valuationPolicy || 'PER_ITEM',
++      commercialRecord: prepared.company.commercialRecord || '',
++      taxNumber: prepared.company.taxNumber || '',
++      phone: prepared.company.phone || '',
++      email: prepared.company.email || '',
++      address: prepared.company.address || '',
++      fiscalYearStart: prepared.company.fiscalYearStart || '2026-01-01',
++    };
++
++    const res = await fetch('/api/company/restore', {
++      method: 'POST',
++      credentials: 'include',
++      headers: {
++        'Content-Type': 'application/json',
++      },
++      body: JSON.stringify({
++        targetMode: params.targetMode,
++        targetCompanyId: targetCid || undefined,
++        companyProfile,
++        state: {
++          ...statePayload,
++          company: { ...prepared.company, id: targetCid },
++          activeCompanyId: targetCid,
++        },
++        expectedRevision: params.expectedRevision,
++        allowReplaceExisting: params.allowReplaceExisting,
++        sourceLabel: params.sourceLabel,
++      }),
++    });
++
++    const data = await parseJsonSafe<{
++      company: ServerCompanyDto;
++      companies: ServerCompanyDto[];
++      activeCompanyId: string;
++      revision: number;
++      licenseBoundary?: LicenseEvaluationResult;
++      serverRevision?: number;
++    }>(res);
++
++    if (!res.ok) {
++      return {
++        ok: false,
++        status: res.status,
++        code: data.code,
++        conflict: res.status === 409,
++        serverRevision: data.serverRevision,
++        error: data.error || 'تعذر اعتماد واستعادة النسخة الاحتياطية على الخادم.',
++      };
++    }
++
++    return {
++      ok: true,
++      company: data.company,
++      companies: data.companies || [],
++      activeCompanyId: data.activeCompanyId,
++      revision: data.revision,
++      licenseBoundary: data.licenseBoundary,
++    };
++  },
++
+   async saveCompanyUser(payload: {
+     id: string;
+     username: string;
+diff --git a/src/services/sqlBakParserService.ts b/src/services/sqlBakParserService.ts
+index df2a05e..31b1e6f 100644
+--- a/src/services/sqlBakParserService.ts
++++ b/src/services/sqlBakParserService.ts
+@@ -59,7 +59,7 @@ export interface ParsedBakDatabase {
+   applyQrightMigration: (
+     currentDb: ERPDatabase,
+     mode: 'merge' | 'replace',
+-    options: { includeCompany: boolean; includeRecentInvoices: boolean }
++    options: { includeCompany: boolean; includeRecentInvoices: boolean; targetCompanyId?: string }
+   ) => { updatedDb: ERPDatabase; stats: QrightMigrationStats };
+ }
+ 
+@@ -612,12 +612,16 @@ export function parseSqlServerBakBuffer(buffer: ArrayBuffer, fileName: string):
+   const applyQrightMigration = (
+     currentDb: ERPDatabase,
+     mode: 'merge' | 'replace',
+-    options: { includeCompany: boolean; includeRecentInvoices: boolean }
++    options: { includeCompany: boolean; includeRecentInvoices: boolean; targetCompanyId?: string }
+   ): { updatedDb: ERPDatabase; stats: QrightMigrationStats } => {
+     const now = new Date().toISOString();
+     const today = now.split('T')[0];
+     const ZERO_GUID = '00000000-0000-0000-0000-000000000000';
+     let updatedDb: ERPDatabase = { ...currentDb };
++    const shouldSwitchCompanyIdentity = mode === 'replace' || options.includeCompany;
++    const resolvedCompanyId =
++      String(options.targetCompanyId || '').trim() ||
++      (shouldSwitchCompanyIdentity ? 'comp-bak-1' : currentDb.activeCompanyId || currentDb.company.id);
+ 
+     // 1. Currencies (resolve base currency first for company profile; handle Arabic Alef Maqsura & inverted rates)
+     const currRows = decodeTable('Currency', 20);
+@@ -689,6 +693,7 @@ export function parseSqlServerBakBuffer(buffer: ArrayBuffer, fileName: string):
+           fullName,
+           role: isAdmin ? 'مالك المؤسسة' : 'محاسب',
+           branchId: 'br-bak-1',
++          allowedCompanyIds: [resolvedCompanyId],
+           email: u.Email ? String(u.Email) : '',
+           active: u.IsView !== false,
+           canViewReports: true,
+@@ -708,7 +713,7 @@ export function parseSqlServerBakBuffer(buffer: ArrayBuffer, fileName: string):
+       .filter((b) => String(b.Name || '').trim() !== '')
+       .map((b, idx) => ({
+         id: `br-bak-${b.Number || idx + 1}`,
+-        companyId: 'comp-bak-1',
++        companyId: resolvedCompanyId,
+         code: String(b.Code || `BR-${idx + 1}`).trim(),
+         nameAr: String(b.Name || dbName).trim(),
+         phone: String(b.Phone || b.Mobile || '').trim(),
+@@ -721,38 +726,86 @@ export function parseSqlServerBakBuffer(buffer: ArrayBuffer, fileName: string):
+     if (mappedBranches.length > 0) {
+       if (mode === 'replace') {
+         updatedDb.branches = mappedBranches;
+-        updatedDb.users = updatedDb.users.map((u) => ({ ...u, branchId: mappedBranches[0].id }));
++        updatedDb.users = updatedDb.users.map((u) => ({
++          ...u,
++          branchId: mappedBranches[0].id,
++          allowedCompanyIds: [resolvedCompanyId],
++        }));
+       } else if (options.includeCompany) {
+         const mergedBr = [...currentDb.branches];
+         mappedBranches.forEach((b) => {
+-          if (!mergedBr.some((x) => x.code === b.code || x.nameAr === b.nameAr)) {
++          if (!mergedBr.some((x) => x.companyId === resolvedCompanyId && (x.code === b.code || x.nameAr === b.nameAr))) {
+             mergedBr.push(b);
+           }
+         });
+         updatedDb.branches = mergedBr;
+       }
++    } else if (mode === 'replace') {
++      updatedDb.branches = [
++        {
++          id: `br-${resolvedCompanyId}`,
++          companyId: resolvedCompanyId,
++          code: 'BR-01',
++          nameAr: String(dbName || currentDb.company.nameAr || 'الفرع الرئيسي').trim(),
++          phone: currentDb.company.phone || '',
++          address: currentDb.company.address || '',
++          managerName: updatedDb.users[0]?.fullName || 'الإدارة',
++          isMain: true,
++          status: 'active',
++        },
++      ];
+     }
+ 
+-    if ((mode === 'replace' || options.includeCompany) && branchRows.length > 0) {
+-      const b0 = branchRows[0];
+-      const compAddr = [b0.Address, b0.StreetName, b0.District, b0.City, b0.Country]
+-        .filter(Boolean)
+-        .map(String)
+-        .join(' - ');
+-      const latin = b0.LatinName && b0.LatinName !== 'Company Name' ? String(b0.LatinName).trim() : '';
+-      updatedDb.company = {
+-        id: 'comp-bak-1',
+-        nameAr: String(b0.Name || dbName).trim(),
+-        nameEn: latin || String(b0.Name || dbName).trim(),
+-        commercialRecord: String(b0.CommercialRegistry || '').trim(),
+-        taxNumber: String(b0.TaxNumber || b0.VatNumber || '').trim(),
+-        phone: String(b0.Phone || b0.Mobile || '').trim(),
+-        email: String(b0.Email || '').trim(),
+-        address: compAddr,
+-        baseCurrency: baseCurrCode,
+-      };
++    if (shouldSwitchCompanyIdentity) {
++      if (branchRows.length > 0) {
++        const b0 = branchRows[0];
++        const compAddr = [b0.Address, b0.StreetName, b0.District, b0.City, b0.Country]
++          .filter(Boolean)
++          .map(String)
++          .join(' - ');
++        const latin = b0.LatinName && b0.LatinName !== 'Company Name' ? String(b0.LatinName).trim() : '';
++        updatedDb.company = {
++          id: resolvedCompanyId,
++          nameAr: String(b0.Name || dbName).trim(),
++          nameEn: latin || String(b0.Name || dbName).trim(),
++          commercialRecord: String(b0.CommercialRegistry || '').trim(),
++          taxNumber: String(b0.TaxNumber || b0.VatNumber || '').trim(),
++          phone: String(b0.Phone || b0.Mobile || '').trim(),
++          email: String(b0.Email || '').trim(),
++          address: compAddr,
++          baseCurrency: baseCurrCode,
++          countryCode: currentDb.company?.countryCode || 'YE',
++          isActive: true,
++          valuationPolicy: currentDb.company?.valuationPolicy || 'PER_ITEM',
++        };
++      } else {
++        updatedDb.company = {
++          ...currentDb.company,
++          id: resolvedCompanyId,
++          nameAr: String(dbName || currentDb.company.nameAr).trim(),
++          nameEn: String(dbName || currentDb.company.nameEn || currentDb.company.nameAr).trim(),
++          baseCurrency: baseCurrCode,
++          isActive: true,
++        };
++      }
++      updatedDb.activeCompanyId = resolvedCompanyId;
++      if (mode === 'replace') {
++        updatedDb.companies = [updatedDb.company];
++      } else {
++        const existingCompanies = currentDb.companies && currentDb.companies.length > 0 ? [...currentDb.companies] : [currentDb.company];
++        const idx = existingCompanies.findIndex((c) => c.id === resolvedCompanyId);
++        updatedDb.companies =
++          idx >= 0
++            ? existingCompanies.map((c, i) => (i === idx ? updatedDb.company : c))
++            : [...existingCompanies, updatedDb.company];
++      }
++    } else {
++      updatedDb.activeCompanyId = resolvedCompanyId;
+     }
+-    const branchId = updatedDb.branches[0]?.id || 'br-1';
++    const branchId =
++      updatedDb.branches.find((b) => b.companyId === resolvedCompanyId)?.id ||
++      updatedDb.branches[0]?.id ||
++      `br-${resolvedCompanyId}`;
+ 
+     // 4. Regional Areas (strictly from Addy hierarchy + distinct Customer City/Address)
+     const addyRows = userTablesByName.has('Addy') ? decodeTable('Addy', 2000) : [];
+@@ -1849,6 +1902,7 @@ export function parseSqlServerBakBuffer(buffer: ArrayBuffer, fileName: string):
+ 
+     const migrationLog = {
+       id: `log-bak-${Date.now()}`,
++      companyId: resolvedCompanyId,
+       timestamp: now,
+       userId: updatedDb.users[0]?.id || 'u-1',
+       userName: updatedDb.users[0]?.fullName || 'الإدارة',
+@@ -1858,6 +1912,65 @@ export function parseSqlServerBakBuffer(buffer: ArrayBuffer, fileName: string):
+     };
+     updatedDb.auditLogs = mode === 'replace' ? [migrationLog] : [migrationLog, ...currentDb.auditLogs];
+ 
++    const stampTargetCompany = <T extends object>(items: T[] | undefined): (T & { companyId: string })[] =>
++      Array.isArray(items)
++        ? items.map((item) => {
++            const existing = (item as { companyId?: string }).companyId;
++            if (mode === 'replace') {
++              return { ...item, companyId: resolvedCompanyId };
++            }
++            return existing && String(existing).trim()
++              ? { ...item, companyId: String(existing) }
++              : { ...item, companyId: resolvedCompanyId };
++          })
++        : [];
++
++    updatedDb = {
++      ...updatedDb,
++      activeCompanyId: resolvedCompanyId,
++      branches: stampTargetCompany(updatedDb.branches),
++      warehouses: stampTargetCompany(updatedDb.warehouses),
++      departments: stampTargetCompany(updatedDb.departments),
++      customers: stampTargetCompany(updatedDb.customers),
++      vendors: stampTargetCompany(updatedDb.vendors),
++      inventoryItems: stampTargetCompany(updatedDb.inventoryItems),
++      warehouseStock: stampTargetCompany(updatedDb.warehouseStock),
++      stockCostLayers: stampTargetCompany(updatedDb.stockCostLayers),
++      inventoryBatches: stampTargetCompany(updatedDb.inventoryBatches),
++      storageLocations: stampTargetCompany(updatedDb.storageLocations),
++      stockMovements: stampTargetCompany(updatedDb.stockMovements),
++      inventoryTransfers: stampTargetCompany(updatedDb.inventoryTransfers),
++      stocktakings: stampTargetCompany(updatedDb.stocktakings),
++      warehouseDocuments: stampTargetCompany(updatedDb.warehouseDocuments),
++      documentBooks: stampTargetCompany(updatedDb.documentBooks),
++      chartOfAccounts: stampTargetCompany(updatedDb.chartOfAccounts),
++      costCenters: stampTargetCompany(updatedDb.costCenters),
++      journalEntries: stampTargetCompany(updatedDb.journalEntries),
++      fiscalPeriods: stampTargetCompany(updatedDb.fiscalPeriods),
++      invoices: stampTargetCompany(updatedDb.invoices),
++      commercialOrders: stampTargetCompany(updatedDb.commercialOrders),
++      treasuryAccounts: stampTargetCompany(updatedDb.treasuryAccounts),
++      paymentVouchers: stampTargetCompany(updatedDb.paymentVouchers),
++      treasuryTransfers: stampTargetCompany(updatedDb.treasuryTransfers),
++      bankReconciliations: stampTargetCompany(updatedDb.bankReconciliations),
++      posShifts: stampTargetCompany(updatedDb.posShifts),
++      heldPosCarts: stampTargetCompany(updatedDb.heldPosCarts),
++      expenseCategories: stampTargetCompany(updatedDb.expenseCategories),
++      expenseRecords: stampTargetCompany(updatedDb.expenseRecords),
++      employees: stampTargetCompany(updatedDb.employees),
++      payrollRuns: stampTargetCompany(updatedDb.payrollRuns),
++      fixedAssets: stampTargetCompany(updatedDb.fixedAssets),
++      customBooks: stampTargetCompany(updatedDb.customBooks),
++      customBookEntries: stampTargetCompany(updatedDb.customBookEntries),
++      approvalRules: stampTargetCompany(updatedDb.approvalRules),
++      approvalRequests: stampTargetCompany(updatedDb.approvalRequests),
++      fxRevaluations: stampTargetCompany(updatedDb.fxRevaluations),
++      savedReportDesigns: stampTargetCompany(updatedDb.savedReportDesigns),
++      auditLogs: stampTargetCompany(updatedDb.auditLogs),
++      taskAlerts: stampTargetCompany(updatedDb.taskAlerts),
++      dispatchLogs: stampTargetCompany(updatedDb.dispatchLogs),
++    };
++
+     updatedDb = reconcileSaudiCurrenciesInDb(updatedDb);
+     return { updatedDb, stats };
+   };
+diff --git a/tests/backup-restore-staging.test.ts b/tests/backup-restore-staging.test.ts
+new file mode 100644
+index 0000000..d9ca10d
+--- /dev/null
++++ b/tests/backup-restore-staging.test.ts
+@@ -0,0 +1,1158 @@
++/**
++ * @license
++ * SPDX-License-Identifier: Apache-2.0
++ * Staging Integration & Security Tests: Two-Stage Backup Restore & Migration Persistence
++ * Tests ONLY against Staging (PGlite / TEST_POSTGRES_URL) — NEVER touches Production.
++ */
++
++import http from 'node:http';
++import { describe, it, expect, beforeEach, afterEach } from 'vitest';
++import {
++  createPgliteExecutor,
++  createPgPoolExecutor,
++  runMigrations,
++  type PgExecutor,
++} from '../server/db';
++import { TENANT_RLS_TABLES } from '../migrations/001_multi_tenant_core';
++import { createErpServerApp } from '../server/app';
++import {
++  hydrateErpDatabaseFromServerState,
++  prepareDatabaseForRestore,
++  type CompanyStatePayload,
++} from '../src/services/cloudApiService';
++import { getInitialDatabase, type ERPDatabase } from '../src/services/storageService';
++import { parseSqlServerBakBuffer } from '../src/services/sqlBakParserService';
++
++async function createStagingPgDb(): Promise<PgExecutor> {
++  const url = String(process.env.TEST_POSTGRES_URL || '').trim();
++  const db = url ? createPgPoolExecutor(url) : createPgliteExecutor('memory://');
++  await runMigrations(db);
++  return db;
++}
++
++async function startStagingServer(db: PgExecutor) {
++  const app = createErpServerApp({
++    db,
++    sessionSecret: 'staging-backup-restore-test-secret-over-32-chars!',
++    rateLimits: { loginPerMinute: 300, aiPerMinute: 60, whatsappPerMinute: 60 },
++  });
++  const server = http.createServer(app);
++  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
++  const addr = server.address();
++  const port = typeof addr === 'object' && addr ? addr.port : 0;
++  return {
++    baseUrl: `http://127.0.0.1:${port}`,
++    close: () =>
++      new Promise<void>((resolve, reject) => server.close((e) => (e ? reject(e) : resolve()))),
++  };
++}
++
++function extractSessionCookie(resp: Response): string {
++  const setCookie = resp.headers.get('set-cookie') || '';
++  return setCookie.split(';')[0];
++}
++
++// =========================================================================
++// Synthetic Uncompressed SQL Server MTF + MDF (.bak / .bakw) Binary Builder
++// =========================================================================
++
++type SqlColDef =
++  | { name: string; type: 'int' }
++  | { name: string; type: 'float' }
++  | { name: string; type: 'bit' }
++  | { name: string; type: 'guid' }
++  | { name: string; type: 'nvarchar' };
++
++function encodeGuidBytes(guidStr: string): Uint8Array {
++  const clean = guidStr.replace(/-/g, '');
++  const out = new Uint8Array(16);
++  const b = (i: number) => parseInt(clean.slice(i * 2, i * 2 + 2), 16) || 0;
++  // Little-endian Data1, Data2, Data3; Big-endian Data4
++  out[0] = b(3);
++  out[1] = b(2);
++  out[2] = b(1);
++  out[3] = b(0);
++  out[4] = b(5);
++  out[5] = b(4);
++  out[6] = b(7);
++  out[7] = b(6);
++  for (let i = 8; i < 16; i++) out[i] = b(i);
++  return out;
++}
++
++function encodeUtf16Le(str: string): Uint8Array {
++  const buf = new Uint8Array(str.length * 2);
++  for (let i = 0; i < str.length; i++) {
++    const code = str.charCodeAt(i);
++    buf[i * 2] = code & 0xff;
++    buf[i * 2 + 1] = (code >> 8) & 0xff;
++  }
++  return buf;
++}
++
++function buildSqlDataRow(
++  fixedCols: Array<{
++    type: 'int' | 'bigint' | 'smallint' | 'tinyint' | 'float' | 'guid' | 'char2' | 'bit';
++    value: number | string | boolean;
++    offset: number;
++    bitpos?: number;
++  }>,
++  fsize: number,
++  totalCols: number,
++  varCols: Uint8Array[]
++): Uint8Array {
++  const nbmLen = Math.ceil(totalCols / 8);
++  const varTotalLen = varCols.reduce((s, c) => s + c.length, 0);
++  const hasVar = varCols.length > 0;
++  const headerAndFixed = fsize;
++  const nbmStart = headerAndFixed + 2;
++  const varHeaderStart = nbmStart + nbmLen;
++  const varDataStart = varHeaderStart + (hasVar ? 2 + 2 * varCols.length : 0);
++  const totalLen = varDataStart + varTotalLen;
++
++  const row = new Uint8Array(totalLen);
++  const dv = new DataView(row.buffer);
++
++  row[0] = hasVar ? 0x30 : 0x10;
++  row[1] = 0x00;
++  dv.setUint16(2, fsize, true);
++
++  for (const fc of fixedCols) {
++    if (fc.type === 'int') dv.setInt32(fc.offset, Number(fc.value), true);
++    else if (fc.type === 'bigint') dv.setBigInt64(fc.offset, BigInt(fc.value), true);
++    else if (fc.type === 'smallint') dv.setInt16(fc.offset, Number(fc.value), true);
++    else if (fc.type === 'tinyint') row[fc.offset] = Number(fc.value) & 0xff;
++    else if (fc.type === 'float') dv.setFloat64(fc.offset, Number(fc.value), true);
++    else if (fc.type === 'guid') row.set(encodeGuidBytes(String(fc.value)), fc.offset);
++    else if (fc.type === 'char2') {
++      const s = String(fc.value).padEnd(2, ' ');
++      row[fc.offset] = s.charCodeAt(0) & 0xff;
++      row[fc.offset + 1] = s.charCodeAt(1) & 0xff;
++    } else if (fc.type === 'bit') {
++      if (fc.value) row[fc.offset] |= 1 << (fc.bitpos || 0);
++    }
++  }
++
++  dv.setUint16(headerAndFixed, totalCols, true);
++
++  if (hasVar) {
++    dv.setUint16(varHeaderStart, varCols.length, true);
++    let cursor = varDataStart;
++    for (let i = 0; i < varCols.length; i++) {
++      row.set(varCols[i], cursor);
++      cursor += varCols[i].length;
++      dv.setUint16(varHeaderStart + 2 + 2 * i, cursor, true);
++    }
++  }
++
++  return row;
++}
++
++function buildSqlPage(
++  pageId: number,
++  pageType: number,
++  objId: number,
++  nextPageId: number,
++  records: Uint8Array[]
++): Uint8Array {
++  const page = new Uint8Array(8192);
++  const dv = new DataView(page.buffer);
++  page[0] = 1;
++  page[1] = pageType;
++  dv.setUint32(16, nextPageId, true);
++  dv.setUint16(22, records.length, true);
++  dv.setUint32(24, objId, true);
++  dv.setUint32(32, pageId, true);
++  dv.setUint16(36, 1, true); // fileId = 1
++
++  let writePtr = 96;
++  records.forEach((rec, idx) => {
++    page.set(rec, writePtr);
++    dv.setUint16(8192 - 2 * (idx + 1), writePtr, true);
++    writePtr += rec.length;
++  });
++  return page;
++}
++
++function buildSyntheticQrightBakBuffer(): ArrayBuffer {
++  const GUID_BRANCH = '11111111-1111-1111-1111-111111111111';
++  const GUID_STORE = '22222222-2222-2222-2222-222222222222';
++  const GUID_ACC_CASH = '33333333-3333-3333-3333-333333333301';
++  const GUID_ACC_CUST1 = '33333333-3333-3333-3333-333333333302';
++  const GUID_ACC_VEND1 = '33333333-3333-3333-3333-333333333303';
++  const GUID_CUST1 = '44444444-4444-4444-4444-444444444401';
++  const GUID_MAT1 = '55555555-5555-5555-5555-555555555501';
++  const GUID_BILL1 = '66666666-6666-6666-6666-666666666601';
++  const GUID_USER1 = '77777777-7777-7777-7777-777777777701';
++
++  const tablesSpec: Array<{
++    name: string;
++    oid: number;
++    cols: SqlColDef[];
++    rows: Array<Record<string, number | string | boolean>>;
++  }> = [
++    {
++      name: 'Branchs',
++      oid: 1001,
++      cols: [
++        { name: 'Number', type: 'int' },
++        { name: 'GUID', type: 'guid' },
++        { name: 'Name', type: 'nvarchar' },
++        { name: 'Phone', type: 'nvarchar' },
++        { name: 'City', type: 'nvarchar' },
++        { name: 'Country', type: 'nvarchar' },
++      ],
++      rows: [
++        {
++          Number: 1,
++          GUID: GUID_BRANCH,
++          Name: 'شركة الرواد التجارية المستعادة',
++          Phone: '777888999',
++          City: 'صنعاء',
++          Country: 'اليمن',
++        },
++      ],
++    },
++    {
++      name: 'Stores',
++      oid: 1002,
++      cols: [
++        { name: 'Number', type: 'int' },
++        { name: 'GUID', type: 'guid' },
++        { name: 'Code', type: 'nvarchar' },
++        { name: 'Name', type: 'nvarchar' },
++      ],
++      rows: [{ Number: 1, GUID: GUID_STORE, Code: 'WH-BAK-1', Name: 'مستودع الرواد المركزي' }],
++    },
++    {
++      name: 'Accounts',
++      oid: 1003,
++      cols: [
++        { name: 'Number', type: 'int' },
++        { name: 'GUID', type: 'guid' },
++        { name: 'Code', type: 'nvarchar' },
++        { name: 'Name', type: 'nvarchar' },
++        { name: 'Debit', type: 'float' },
++        { name: 'Credit', type: 'float' },
++      ],
++      rows: [
++        { Number: 1, GUID: GUID_ACC_CASH, Code: '131', Name: 'الصندوق الرئيسي المستعاد', Debit: 250000, Credit: 0 },
++        { Number: 2, GUID: GUID_ACC_CUST1, Code: '12101', Name: 'شركة الأمل للمقاولات', Debit: 75000, Credit: 0 },
++        { Number: 3, GUID: GUID_ACC_VEND1, Code: '22101', Name: 'مورد النخبة الدولي', Debit: 0, Credit: 42000 },
++      ],
++    },
++    {
++      name: 'Customers',
++      oid: 1004,
++      cols: [
++        { name: 'Number', type: 'int' },
++        { name: 'GUID', type: 'guid' },
++        { name: 'AccountGUID', type: 'guid' },
++        { name: 'Code', type: 'nvarchar' },
++        { name: 'Name', type: 'nvarchar' },
++        { name: 'Mobile', type: 'nvarchar' },
++        { name: 'City', type: 'nvarchar' },
++      ],
++      rows: [
++        {
++          Number: 1,
++          GUID: GUID_CUST1,
++          AccountGUID: GUID_ACC_CUST1,
++          Code: 'C-BAK-1',
++          Name: 'شركة الأمل للمقاولات',
++          Mobile: '771234567',
++          City: 'عدن',
++        },
++      ],
++    },
++    {
++      name: 'Materials',
++      oid: 1005,
++      cols: [
++        { name: 'Number', type: 'int' },
++        { name: 'GUID', type: 'guid' },
++        { name: 'Code', type: 'nvarchar' },
++        { name: 'Name', type: 'nvarchar' },
++        { name: 'Unity', type: 'nvarchar' },
++        { name: 'Last', type: 'float' },
++        { name: 'Consumer', type: 'float' },
++      ],
++      rows: [
++        {
++          Number: 1,
++          GUID: GUID_MAT1,
++          Code: 'IT-BAK-1',
++          Name: 'كابل طاقة صناعي 16مم',
++          Unity: 'لفة',
++          Last: 12000,
++          Consumer: 15000,
++        },
++      ],
++    },
++    {
++      name: 'StoresInventory',
++      oid: 1006,
++      cols: [
++        { name: 'MaterialGUID', type: 'guid' },
++        { name: 'StoreGUID', type: 'guid' },
++        { name: 'Qty', type: 'float' },
++      ],
++      rows: [{ MaterialGUID: GUID_MAT1, StoreGUID: GUID_STORE, Qty: 48 }],
++    },
++    {
++      name: 'Bills',
++      oid: 1007,
++      cols: [
++        { name: 'Number', type: 'int' },
++        { name: 'GUID', type: 'guid' },
++        { name: 'CustGUID', type: 'guid' },
++        { name: 'StoreGUID', type: 'guid' },
++        { name: 'PayType', type: 'int' },
++        { name: 'TotalMats', type: 'float' },
++        { name: 'TotalFinal', type: 'float' },
++        { name: 'Paid', type: 'float' },
++        { name: 'BillType', type: 'int' },
++      ],
++      rows: [
++        {
++          Number: 901,
++          GUID: GUID_BILL1,
++          CustGUID: GUID_CUST1,
++          StoreGUID: GUID_STORE,
++          PayType: 1,
++          TotalMats: 75000,
++          TotalFinal: 75000,
++          Paid: 0,
++          BillType: 0,
++        },
++      ],
++    },
++    {
++      name: 'BillItems',
++      oid: 1008,
++      cols: [
++        { name: 'ParentGUID', type: 'guid' },
++        { name: 'MaterialGUID', type: 'guid' },
++        { name: 'Qty', type: 'float' },
++        { name: 'Price', type: 'float' },
++        { name: 'TotalFinal', type: 'float' },
++      ],
++      rows: [
++        {
++          ParentGUID: GUID_BILL1,
++          MaterialGUID: GUID_MAT1,
++          Qty: 5,
++          Price: 15000,
++          TotalFinal: 75000,
++        },
++      ],
++    },
++    {
++      name: 'Users',
++      oid: 1009,
++      cols: [
++        { name: 'GUID', type: 'guid' },
++        { name: 'Name', type: 'nvarchar' },
++      ],
++      rows: [{ GUID: GUID_USER1, Name: 'مستخدم النسخة الاحتياطية القديم' }],
++    },
++  ];
++
++  // Page allocations:
++  // 0: File Header (type 15)
++  // 1: Page 1 (required by findMdfBounds)
++  // 9: Boot page (type 13) with UTF-16 DB name
++  // 10: sysallocunits (obj=7)
++  // 11: sysrowsets (obj=5)
++  // 12: sysschobjs (obj=34)
++  // 13-14: syscolpars (obj=41)
++  // 15-16: sysrscols (obj=3)
++  // 20+: one data page per table (oid = 1001..1009)
++  const totalPages = 32;
++  const pageBuffers: Uint8Array[] = Array.from({ length: totalPages }, (_, pgId) =>
++    buildSqlPage(pgId, pgId === 0 ? 15 : 1, 999, 0, [])
++  );
++
++  // Page 9: Boot Page with DB Name
++  const bootPage = buildSqlPage(9, 13, 0, 0, []);
++  bootPage.set(encodeUtf16Le('QrightBakStaging'), 112);
++  pageBuffers[9] = bootPage;
++
++  const allocRecords: Uint8Array[] = [];
++  const rowsetRecords: Uint8Array[] = [];
++  const schRecords: Uint8Array[] = [];
++  const colRecords: Uint8Array[] = [];
++  const rscolRecords: Uint8Array[] = [];
++
++  tablesSpec.forEach((tbl, tIdx) => {
++    const dataPgId = 20 + tIdx;
++    const rsid = BigInt(7000 + tIdx);
++    const auid = BigInt(8000 + tIdx);
++
++    // sysallocunits row (fsize >= 45): auid@4, atype@12, ownerid@13, pgfirst@27, pgiam@39
++    allocRecords.push(
++      buildSqlDataRow(
++        [
++          { type: 'bigint', value: Number(auid), offset: 4 },
++          { type: 'tinyint', value: 1, offset: 12 },
++          { type: 'bigint', value: Number(rsid), offset: 13 },
++          { type: 'int', value: dataPgId, offset: 27 },
++          { type: 'int', value: 0, offset: 39 },
++        ],
++        46,
++        5,
++        []
++      )
++    );
++
++    // sysrowsets row (fsize >= 21): rsid@4, idmajor@13, idminor@17
++    rowsetRecords.push(
++      buildSqlDataRow(
++        [
++          { type: 'bigint', value: Number(rsid), offset: 4 },
++          { type: 'int', value: tbl.oid, offset: 13 },
++          { type: 'int', value: 0, offset: 17 },
++        ],
++        22,
++        3,
++        []
++      )
++    );
++
++    // sysschobjs row (fsize >= 19): oid@4, otype@17('U '), vcol[0]=tableName
++    schRecords.push(
++      buildSqlDataRow(
++        [
++          { type: 'int', value: tbl.oid, offset: 4 },
++          { type: 'char2', value: 'U ', offset: 17 },
++        ],
++        20,
++        3,
++        [encodeUtf16Le(tbl.name)]
++      )
++    );
++
++    // Compute fixed & variable offsets for table columns
++    let fixedOff = 4;
++    let varIdx = 0;
++    const colOffsets: Array<{ col: SqlColDef; colid: number; rscOffset: number; len: number; xtype: number }> = [];
++    tbl.cols.forEach((col, cIdx) => {
++      const colid = cIdx + 1;
++      if (col.type === 'int') {
++        colOffsets.push({ col, colid, rscOffset: fixedOff, len: 4, xtype: 56 });
++        fixedOff += 4;
++      } else if (col.type === 'float') {
++        colOffsets.push({ col, colid, rscOffset: fixedOff, len: 8, xtype: 62 });
++        fixedOff += 8;
++      } else if (col.type === 'guid') {
++        colOffsets.push({ col, colid, rscOffset: fixedOff, len: 16, xtype: 36 });
++        fixedOff += 16;
++      } else if (col.type === 'bit') {
++        colOffsets.push({ col, colid, rscOffset: fixedOff, len: 1, xtype: 104 });
++        fixedOff += 1;
++      } else {
++        varIdx += 1;
++        colOffsets.push({ col, colid, rscOffset: -varIdx, len: 256, xtype: 231 });
++      }
++    });
++
++    for (const meta of colOffsets) {
++      // syscolpars row: oid@4, num@8(0), colid@10, xtype@14, length@19, prec@21, scale@22, vcol[0]=name
++      colRecords.push(
++        buildSqlDataRow(
++          [
++            { type: 'int', value: tbl.oid, offset: 4 },
++            { type: 'smallint', value: 0, offset: 8 },
++            { type: 'int', value: meta.colid, offset: 10 },
++            { type: 'tinyint', value: meta.xtype, offset: 14 },
++            { type: 'smallint', value: meta.len, offset: 19 },
++          ],
++          28,
++          6,
++          [encodeUtf16Le(meta.col.name)]
++        )
++      );
++      // sysrscols row: rsid@4, rscolid@12, hbcolid@16, offset@44, nullbit@48, bitpos@52
++      rscolRecords.push(
++        buildSqlDataRow(
++          [
++            { type: 'bigint', value: Number(rsid), offset: 4 },
++            { type: 'int', value: meta.colid, offset: 12 },
++            { type: 'int', value: meta.colid, offset: 16 },
++            { type: 'smallint', value: meta.rscOffset, offset: 44 },
++            { type: 'smallint', value: 0, offset: 48 },
++            { type: 'smallint', value: 0, offset: 52 },
++          ],
++          55,
++          6,
++          []
++        )
++      );
++    }
++
++    const rowBytes = tbl.rows.map((r) => {
++      const fVals: Array<{
++        type: 'int' | 'bigint' | 'smallint' | 'tinyint' | 'float' | 'guid' | 'char2' | 'bit';
++        value: number | string | boolean;
++        offset: number;
++      }> = [];
++      const vVals: Uint8Array[] = [];
++      for (const meta of colOffsets) {
++        const val = r[meta.col.name] ?? '';
++        if (meta.col.type === 'int') fVals.push({ type: 'int', value: Number(val), offset: meta.rscOffset });
++        else if (meta.col.type === 'float') fVals.push({ type: 'float', value: Number(val), offset: meta.rscOffset });
++        else if (meta.col.type === 'guid') fVals.push({ type: 'guid', value: String(val), offset: meta.rscOffset });
++        else if (meta.col.type === 'bit') fVals.push({ type: 'bit', value: Boolean(val), offset: meta.rscOffset });
++        else vVals.push(encodeUtf16Le(String(val)));
++      }
++      return buildSqlDataRow(fVals, fixedOff, tbl.cols.length, vVals);
++    });
++
++    pageBuffers[dataPgId] = buildSqlPage(dataPgId, 1, tbl.oid, 0, rowBytes);
++  });
++
++  // Pack system metadata across pages (chunk syscolpars & sysrscols cleanly so they stay under 8192 bytes)
++  pageBuffers[10] = buildSqlPage(10, 1, 7, 0, allocRecords);
++  pageBuffers[11] = buildSqlPage(11, 1, 5, 0, rowsetRecords);
++  pageBuffers[12] = buildSqlPage(12, 1, 34, 0, schRecords);
++  const midCol = Math.ceil(colRecords.length / 2);
++  pageBuffers[13] = buildSqlPage(13, 1, 41, 14, colRecords.slice(0, midCol));
++  pageBuffers[14] = buildSqlPage(14, 1, 41, 0, colRecords.slice(midCol));
++  const midRs = Math.ceil(rscolRecords.length / 2);
++  pageBuffers[15] = buildSqlPage(15, 1, 3, 16, rscolRecords.slice(0, midRs));
++  pageBuffers[16] = buildSqlPage(16, 1, 3, 0, rscolRecords.slice(midRs));
++
++  // Combine 512B MTF header + all MDF 8192-byte pages
++  const mtfHeaderSize = 512;
++  const full = new Uint8Array(mtfHeaderSize + totalPages * 8192);
++  for (let i = 0; i < totalPages; i++) {
++    full.set(pageBuffers[i], mtfHeaderSize + i * 8192);
++  }
++  return full.buffer;
++}
++
++describe('Staging Two-Stage Backup Restore, Migration & Transaction Rollback Suite', () => {
++  let db: PgExecutor | null = null;
++  let srv: Awaited<ReturnType<typeof startStagingServer>> | null = null;
++
++  beforeEach(async () => {
++    db = await createStagingPgDb();
++  }, 30_000);
++
++  afterEach(async () => {
++    if (srv) {
++      await srv.close();
++      srv = null;
++    }
++    if (db) {
++      await db.close();
++      db = null;
++    }
++  });
++
++  async function bootstrapOwner(baseUrl: string) {
++    const boot = await fetch(`${baseUrl}/api/auth/bootstrap`, {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json' },
++      body: JSON.stringify({
++        id: 'usr-owner',
++        username: 'owner',
++        fullName: 'عبد الرحمن المنصور',
++        password: 'OwnerStagingPass2026',
++        company: {
++          id: 'comp-01',
++          nameAr: 'الشركة الافتراضية الرئيسية',
++          countryCode: 'YE',
++          baseCurrency: 'YER',
++        },
++      }),
++    });
++    expect(boot.status).toBe(201);
++    const cookie = extractSessionCookie(boot);
++    const data = await boot.json();
++    return { cookie, data };
++  }
++
++  it('1. Restores JSON backup as independent company & within current company, persisting active company across F5 & re-login', async () => {
++    srv = await startStagingServer(db!);
++    const { cookie: ownerCookie } = await bootstrapOwner(srv.baseUrl);
++
++    // Prepare JSON backup payload for a distinct restored company with invoices, items, customers
++    const seed = getInitialDatabase();
++    const stampedSeed = prepareDatabaseForRestore(seed, 'comp-json-restored', 'current_company');
++    const jsonBackup: ERPDatabase = {
++      ...stampedSeed,
++      company: {
++        ...stampedSeed.company,
++        id: 'comp-json-restored',
++        nameAr: 'شركة المنار المستعادة JSON',
++        nameEn: 'Almanar Restored Trading',
++        baseCurrency: 'SAR',
++        countryCode: 'SA',
++      },
++      companies: [
++        {
++          ...stampedSeed.company,
++          id: 'comp-json-restored',
++          nameAr: 'شركة المنار المستعادة JSON',
++        },
++      ],
++      activeCompanyId: 'comp-json-restored',
++      customers: [
++        {
++          ...stampedSeed.customers[0],
++          id: 'cust-json-1',
++          companyId: 'comp-json-restored',
++          code: 'C-JSON-01',
++          nameAr: 'عميل المنار التجاري',
++          currentBalance: 14500,
++        },
++      ],
++      inventoryItems: [
++        {
++          ...stampedSeed.inventoryItems[0],
++          id: 'item-json-1',
++          companyId: 'comp-json-restored',
++          code: 'SKU-JSON-01',
++          nameAr: 'جهاز خادم سحابي',
++          salePrice: 5200,
++        },
++      ],
++      invoices: [
++        {
++          ...stampedSeed.invoices[0],
++          id: 'inv-json-1',
++          companyId: 'comp-json-restored',
++          invoiceNumber: 'INV-JSON-9001',
++          entityId: 'cust-json-1',
++          entityName: 'عميل المنار التجاري',
++          grandTotal: 5200,
++        },
++      ],
++    };
++
++    const prepared = prepareDatabaseForRestore(jsonBackup, 'comp-json-restored', 'restored_company');
++    const { users: _u, companies: _c, ...statePayload } = prepared;
++
++    // Stage 2 commit: restore as independent company (Super Admin)
++    const restoreRes = await fetch(`${srv.baseUrl}/api/company/restore`, {
++      method: 'POST',
++      headers: {
++        'Content-Type': 'application/json',
++        Cookie: ownerCookie,
++      },
++      body: JSON.stringify({
++        targetMode: 'restored_company',
++        targetCompanyId: 'comp-json-restored',
++        companyProfile: prepared.company,
++        state: statePayload,
++        sourceLabel: 'almanar-backup.json',
++      }),
++    });
++    expect(restoreRes.status).toBe(200);
++    const restoreJson = await restoreRes.json();
++    expect(restoreJson.ok).toBe(true);
++    expect(restoreJson.activeCompanyId).toBe('comp-json-restored');
++    expect(restoreJson.company.nameAr).toBe('شركة المنار المستعادة JSON');
++    expect(restoreJson.companies.map((c: { id: string }) => c.id)).toEqual([
++      'comp-01',
++      'comp-json-restored',
++    ]);
++
++    const updatedCookie = extractSessionCookie(restoreRes);
++    expect(updatedCookie).toContain('erp_session=');
++
++    // Simulate page reload (F5): must stay on 'comp-json-restored' and NEVER revert to 'comp-01'
++    const statusRes = await fetch(`${srv.baseUrl}/api/auth/status`, {
++      headers: { Cookie: updatedCookie },
++    });
++    const statusData = await statusRes.json();
++    expect(statusData.authenticated).toBe(true);
++    expect(statusData.activeCompanyId).toBe('comp-json-restored');
++
++    const stateRes = await fetch(`${srv.baseUrl}/api/company/state`, {
++      headers: { Cookie: updatedCookie },
++    });
++    expect(stateRes.status).toBe(200);
++    const stateData = (await stateRes.json()) as CompanyStatePayload;
++    expect(stateData.companyId).toBe('comp-json-restored');
++    const hydrated = hydrateErpDatabaseFromServerState(stateData);
++    expect(hydrated.company.id).toBe('comp-json-restored');
++    expect(hydrated.activeCompanyId).toBe('comp-json-restored');
++    expect(hydrated.customers.find((c) => c.id === 'cust-json-1')?.currentBalance).toBe(14500);
++    expect(hydrated.invoices.find((i) => i.invoiceNumber === 'INV-JSON-9001')?.grandTotal).toBe(5200);
++    expect(hydrated.inventoryItems.find((it) => it.code === 'SKU-JSON-01')?.nameAr).toBe('جهاز خادم سحابي');
++
++    // Simulate logout & login: must resume on 'comp-json-restored'
++    await fetch(`${srv.baseUrl}/api/auth/logout`, { method: 'POST', headers: { Cookie: updatedCookie } });
++    const loginRes = await fetch(`${srv.baseUrl}/api/auth/login`, {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json' },
++      body: JSON.stringify({ username: 'owner', password: 'OwnerStagingPass2026' }),
++    });
++    expect(loginRes.status).toBe(200);
++    const loginData = await loginRes.json();
++    expect(loginData.activeCompanyId).toBe('comp-json-restored');
++
++    // Also test restoring inside current_company (overwrites active company state cleanly & stamps records)
++    const loginCookie = extractSessionCookie(loginRes);
++    const inPlaceBackup = prepareDatabaseForRestore(
++      {
++        ...seed,
++        company: { ...seed.company, id: 'comp-legacy-origin', nameAr: 'المنار المحدثة موضعياً' },
++        customers: [
++          { ...seed.customers[0], id: 'cust-inplace', companyId: 'comp-legacy-origin', nameAr: 'عميل التحديث الموضعي' },
++        ],
++      },
++      'comp-json-restored',
++      'current_company'
++    );
++    const { users: _u2, companies: _c2, ...inPlacePayload } = inPlaceBackup;
++    const inPlaceRes = await fetch(`${srv.baseUrl}/api/company/restore`, {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json', Cookie: loginCookie },
++      body: JSON.stringify({
++        targetMode: 'current_company',
++        companyProfile: inPlaceBackup.company,
++        state: inPlacePayload,
++        expectedRevision: stateData.revision,
++      }),
++    });
++    expect(inPlaceRes.status).toBe(200);
++    const inPlaceJson = await inPlaceRes.json();
++    expect(inPlaceJson.activeCompanyId).toBe('comp-json-restored');
++    expect(inPlaceJson.revision).toBe(stateData.revision + 1);
++    expect(inPlaceJson.company.nameAr).toBe('المنار المحدثة موضعياً');
++  });
++
++  it('2. Parses .bak and .bakw binary SQL Server backups, aligns Stage 1 IDs, and restores full financial/inventory/customer data in Stage 2', async () => {
++    srv = await startStagingServer(db!);
++    const { cookie: ownerCookie } = await bootstrapOwner(srv.baseUrl);
++    const currentDb = getInitialDatabase();
++    const binaryBuffer = buildSyntheticQrightBakBuffer();
++
++    for (const ext of ['.bak', '.bakw'] as const) {
++      const parsed = parseSqlServerBakBuffer(binaryBuffer, `staging_qright${ext}`);
++      const preview = parsed.getQrightMigrationPreview();
++      expect(preview.isQrightSchema).toBe(true);
++      expect(preview.counts.accounts).toBe(3);
++      expect(preview.counts.customers).toBe(1);
++      expect(preview.counts.materials).toBe(1);
++      expect(preview.counts.bills).toBe(1);
++
++      // Stage 1: Verify company.id, activeCompanyId, companies[], and every record's companyId match
++      const targetCompId = ext === '.bak' ? undefined : 'comp-bakw-2';
++      const { updatedDb, stats } = parsed.applyQrightMigration(currentDb, 'replace', {
++        includeCompany: true,
++        includeRecentInvoices: true,
++        targetCompanyId: targetCompId,
++      });
++
++      const expectedCid = targetCompId || 'comp-bak-1';
++      expect(stats.accountsImported).toBe(3);
++      expect(stats.customersImported).toBe(1);
++      expect(stats.vendorsImported).toBe(1);
++      expect(stats.itemsImported).toBe(1);
++      expect(stats.stockRowsImported).toBe(1);
++      expect(stats.invoicesImported).toBe(1);
++
++      expect(updatedDb.company.id).toBe(expectedCid);
++      expect(updatedDb.activeCompanyId).toBe(expectedCid);
++      expect((updatedDb.companies || []).map((c) => c.id)).toEqual([expectedCid]);
++      expect(updatedDb.customers.every((c) => c.companyId === expectedCid)).toBe(true);
++      expect(updatedDb.vendors.every((v) => v.companyId === expectedCid)).toBe(true);
++      expect(updatedDb.inventoryItems.every((it) => it.companyId === expectedCid)).toBe(true);
++      expect(updatedDb.warehouseStock.every((ws) => ws.companyId === expectedCid)).toBe(true);
++      expect(updatedDb.invoices.every((inv) => inv.companyId === expectedCid)).toBe(true);
++      expect(updatedDb.chartOfAccounts.every((acc) => acc.companyId === expectedCid)).toBe(true);
++
++      // Stage 2: Commit to PostgreSQL via /api/company/restore
++      const prepared = prepareDatabaseForRestore(updatedDb, expectedCid, 'restored_company');
++      const { users: _u, companies: _c, ...statePayload } = prepared;
++      const restoreRes = await fetch(`${srv.baseUrl}/api/company/restore`, {
++        method: 'POST',
++        headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
++        body: JSON.stringify({
++          targetMode: 'restored_company',
++          targetCompanyId: expectedCid,
++          companyProfile: prepared.company,
++          state: statePayload,
++          sourceLabel: `staging_qright${ext}`,
++        }),
++      });
++      expect(restoreRes.status).toBe(200);
++      const restoreData = await restoreRes.json();
++      expect(restoreData.activeCompanyId).toBe(expectedCid);
++
++      const newCookie = extractSessionCookie(restoreRes);
++      const getStateRes = await fetch(`${srv.baseUrl}/api/company/state`, {
++        headers: { Cookie: newCookie },
++      });
++      expect(getStateRes.status).toBe(200);
++      const snapshot = (await getStateRes.json()) as CompanyStatePayload;
++      const hydrated = hydrateErpDatabaseFromServerState(snapshot);
++
++      // Verify restored financial, inventory, customer & vendor integrity
++      expect(hydrated.company.id).toBe(expectedCid);
++      expect(hydrated.company.nameAr).toBe('شركة الرواد التجارية المستعادة');
++      expect(hydrated.activeCompanyId).toBe(expectedCid);
++      expect(hydrated.customers).toHaveLength(1);
++      expect(hydrated.customers[0].nameAr).toBe('شركة الأمل للمقاولات');
++      expect(hydrated.vendors).toHaveLength(1);
++      expect(hydrated.vendors[0].nameAr).toBe('مورد النخبة الدولي');
++      expect(hydrated.inventoryItems).toHaveLength(1);
++      expect(hydrated.inventoryItems[0].nameAr).toBe('كابل طاقة صناعي 16مم');
++      expect(hydrated.warehouseStock[0].quantityOnHand).toBe(48);
++      expect(hydrated.invoices).toHaveLength(1);
++      expect(hydrated.invoices[0].grandTotal).toBe(75000);
++      expect(hydrated.invoices[0].items[0].quantity).toBe(5);
++    }
++  });
++
++  it('3. Enforces 403/409 protections, PostgreSQL RLS isolation, and NEVER imports passwords or permissions from backups', async () => {
++    srv = await startStagingServer(db!);
++    const { cookie: ownerCookie } = await bootstrapOwner(srv.baseUrl);
++
++    // Create Tenant Admin in comp-01 (non-Super-Admin) & Restricted user
++    const createTenantAdmin = await fetch(`${srv.baseUrl}/api/company/users`, {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
++      body: JSON.stringify({
++        id: 'usr-tadmin',
++        username: 'tenant_admin_01',
++        fullName: 'مدير منشأة محلي',
++        role: 'Tenant Admin',
++        password: 'TenantAdminPass2026',
++        branchId: 'br-01',
++        active: true,
++      }),
++    });
++    expect(createTenantAdmin.status).toBe(201);
++
++    const createRestricted = await fetch(`${srv.baseUrl}/api/company/users`, {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
++      body: JSON.stringify({
++        id: 'usr-cashier',
++        username: 'cashier_01',
++        fullName: 'مستخدم محدود',
++        role: 'مستخدم محدود',
++        password: 'CashierUser2026',
++        branchId: 'br-01',
++        active: true,
++      }),
++    });
++    expect(createRestricted.status).toBe(201);
++
++    // Register separate Tenant B to verify cross-tenant isolation
++    const regB = await fetch(`${srv.baseUrl}/api/auth/register`, {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json' },
++      body: JSON.stringify({
++        username: 'tenant_b_admin',
++        fullName: 'مدير منشأة B',
++        password: 'TenantBPass2026',
++        company: { id: 'comp-b-isolated', nameAr: 'شركة B المعزولة', countryCode: 'YE', baseCurrency: 'YER' },
++      }),
++    });
++    expect(regB.status).toBe(201);
++
++    const tAdminLogin = await fetch(`${srv.baseUrl}/api/auth/login`, {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json' },
++      body: JSON.stringify({ username: 'tenant_admin_01', password: 'TenantAdminPass2026' }),
++    });
++    const tAdminCookie = extractSessionCookie(tAdminLogin);
++
++    const cashierLogin = await fetch(`${srv.baseUrl}/api/auth/login`, {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json' },
++      body: JSON.stringify({ username: 'cashier_01', password: 'CashierUser2026' }),
++    });
++    const cashierCookie = extractSessionCookie(cashierLogin);
++
++    const seed = getInitialDatabase();
++    const scopedState = prepareDatabaseForRestore(seed, 'comp-01', 'current_company');
++
++    // A) Restricted user cannot call /api/company/restore -> 403
++    const resRestricted = await fetch(`${srv.baseUrl}/api/company/restore`, {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json', Cookie: cashierCookie },
++      body: JSON.stringify({ targetMode: 'current_company', state: scopedState }),
++    });
++    expect(resRestricted.status).toBe(403);
++
++    // B) Tenant Admin cannot create independent restored company -> 403 FORBIDDEN_SUPER_ADMIN_ONLY
++    const resTAdminNew = await fetch(`${srv.baseUrl}/api/company/restore`, {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json', Cookie: tAdminCookie },
++      body: JSON.stringify({
++        targetMode: 'restored_company',
++        targetCompanyId: 'comp-unauthorized-new',
++        state: prepareDatabaseForRestore(seed, 'comp-unauthorized-new', 'restored_company'),
++      }),
++    });
++    expect(resTAdminNew.status).toBe(403);
++    expect((await resTAdminNew.json()).code).toBe('FORBIDDEN_SUPER_ADMIN_ONLY');
++
++    // C) Tenant Admin cannot overwrite another tenant's company (comp-b-isolated) -> 403 TENANT_ISOLATION_VIOLATION
++    const resCrossTenant = await fetch(`${srv.baseUrl}/api/company/restore`, {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json', Cookie: tAdminCookie },
++      body: JSON.stringify({
++        targetMode: 'current_company',
++        targetCompanyId: 'comp-b-isolated',
++        state: prepareDatabaseForRestore(seed, 'comp-b-isolated', 'current_company'),
++      }),
++    });
++    expect(resCrossTenant.status).toBe(403);
++    expect((await resCrossTenant.json()).code).toBe('TENANT_ISOLATION_VIOLATION');
++
++    // D) Owner restoring existing company in restored_company mode without allowReplaceExisting -> 409 COMPANY_ALREADY_EXISTS
++    const resDup = await fetch(`${srv.baseUrl}/api/company/restore`, {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
++      body: JSON.stringify({
++        targetMode: 'restored_company',
++        targetCompanyId: 'comp-01',
++        state: scopedState,
++        allowReplaceExisting: false,
++      }),
++    });
++    expect(resDup.status).toBe(409);
++    expect((await resDup.json()).code).toBe('COMPANY_ALREADY_EXISTS');
++
++    // E) Stale expectedRevision -> 409 REVISION_CONFLICT
++    const initialStateRes = await fetch(`${srv.baseUrl}/api/company/state`, {
++      headers: { Cookie: ownerCookie },
++    });
++    const initialStateJson = await initialStateRes.json();
++    const save1 = await fetch(`${srv.baseUrl}/api/company/state`, {
++      method: 'PUT',
++      headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
++      body: JSON.stringify({
++        companyId: 'comp-01',
++        expectedRevision: initialStateJson.revision,
++        state: { ...scopedState, company: { ...scopedState.company, id: 'comp-01' }, activeCompanyId: 'comp-01' },
++      }),
++    });
++    expect(save1.status).toBe(200);
++
++    const resStale = await fetch(`${srv.baseUrl}/api/company/restore`, {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
++      body: JSON.stringify({
++        targetMode: 'current_company',
++        expectedRevision: 0,
++        state: scopedState,
++      }),
++    });
++    expect(resStale.status).toBe(409);
++    expect((await resStale.json()).code).toBe('REVISION_CONFLICT');
++
++    // F) Rule #6: Malicious backup injecting users/passwords/isSuperAdmin must NEVER overwrite DB auth or leak into state_json
++    const cleanTargetSeed = prepareDatabaseForRestore(seed, 'comp-clean-isolated', 'current_company');
++    const { users: _uClean, companies: _cClean, ...cleanTargetPayload } = cleanTargetSeed;
++    const poisonedPayload = {
++      ...cleanTargetPayload,
++      passwordHash: 'hijacked_hash',
++      passwordSalt: 'hijacked_salt',
++      users: [
++        {
++          id: 'usr-tadmin',
++          username: 'tenant_admin_01',
++          role: 'مالك المؤسسة',
++          isSuperAdmin: true,
++          passwordHash: 'evil_hash',
++          passwordSalt: 'evil_salt',
++        },
++        {
++          id: 'usr-backdoor',
++          username: 'backdoor_admin',
++          role: 'مالك المؤسسة',
++          isSuperAdmin: true,
++          passwordHash: 'evil_hash_2',
++          passwordSalt: 'evil_salt_2',
++        },
++      ],
++      companies: [{ id: 'comp-01', nameAr: 'Comp' }, { id: 'comp-b-isolated', nameAr: 'Hijacked' }],
++    };
++
++    // Mixed-tenant tampering inside restored_company mode must be rejected (403 TENANT_ISOLATION_VIOLATION)
++    const tamperedMixedRes = await fetch(`${srv.baseUrl}/api/company/restore`, {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
++      body: JSON.stringify({
++        targetMode: 'restored_company',
++        targetCompanyId: 'comp-clean-isolated',
++        state: {
++          ...cleanTargetPayload,
++          customers: [{ ...cleanTargetSeed.customers[0], companyId: 'comp-b-isolated' }],
++        },
++      }),
++    });
++    expect(tamperedMixedRes.status).toBe(403);
++    expect((await tamperedMixedRes.json()).code).toBe('TENANT_ISOLATION_VIOLATION');
++
++    const resSanitized = await fetch(`${srv.baseUrl}/api/company/restore`, {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
++      body: JSON.stringify({
++        targetMode: 'restored_company',
++        targetCompanyId: 'comp-clean-isolated',
++        companyProfile: { id: 'comp-clean-isolated', nameAr: 'شركة نظيفة معزولة' },
++        state: {
++          ...poisonedPayload,
++          company: { ...cleanTargetSeed.company, id: 'comp-clean-isolated', nameAr: 'شركة نظيفة معزولة' },
++          activeCompanyId: 'comp-clean-isolated',
++          auditLogs: [],
++        },
++      }),
++    });
++    expect(resSanitized.status).toBe(200);
++
++    // Verify DB user credentials & privileges were NOT modified and backdoor user was NOT created
++    const usersCheck = await db!.query<{ id: string; username: string; is_super_admin: boolean; role: string }>(
++      'SELECT id, username, is_super_admin, role FROM users ORDER BY id'
++    );
++    expect(usersCheck.rows.some((u) => u.username === 'backdoor_admin')).toBe(false);
++    const tAdminRow = usersCheck.rows.find((u) => u.id === 'usr-tadmin');
++    expect(tAdminRow?.is_super_admin).toBe(false);
++    expect(tAdminRow?.role).toBe('Tenant Admin');
++
++    // Backdoor login fails (401), real Tenant Admin login still succeeds (200)
++    const backdoorAttempt = await fetch(`${srv.baseUrl}/api/auth/login`, {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json' },
++      body: JSON.stringify({ username: 'backdoor_admin', password: 'evil' }),
++    });
++    expect(backdoorAttempt.status).toBe(401);
++
++    const realTAdminRes = await fetch(`${srv.baseUrl}/api/auth/login`, {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json' },
++      body: JSON.stringify({ username: 'tenant_admin_01', password: 'TenantAdminPass2026' }),
++    });
++    expect(realTAdminRes.status).toBe(200);
++
++    // Verify stored state_json has zero users/companies/passwordHash keys
++    const storedStateRow = await db!.transaction(
++      async (tx) =>
++        (
++          await tx.query<{ state_json: Record<string, unknown> }>(
++            'SELECT state_json FROM company_state WHERE company_id = $1',
++            ['comp-clean-isolated']
++          )
++        ).rows[0],
++      { companyId: 'comp-clean-isolated' }
++    );
++    expect(storedStateRow?.state_json).toBeDefined();
++    expect('users' in storedStateRow.state_json).toBe(false);
++    expect('companies' in storedStateRow.state_json).toBe(false);
++    expect('passwordHash' in storedStateRow.state_json).toBe(false);
++
++    // Verify RLS remains ENABLED + FORCED on all 5 multi-tenant tables
++    const rls = await db!.checkRlsStatus();
++    expect(rls.rlsTables.map((t) => t.table).sort()).toEqual([...TENANT_RLS_TABLES].sort());
++    for (const t of rls.rlsTables) {
++      expect(t.enabled).toBe(true);
++      expect(t.forced).toBe(true);
++    }
++  });
++
++  it('4. Executes restore inside an atomic PostgreSQL transaction and rolls back completely on mid-transaction failure', async () => {
++    const rawDb = db!;
++    let failOnCompanyStateInsert = false;
++
++    const faultInjectedDb: PgExecutor = {
++      dialect: rawDb.dialect,
++      query: rawDb.query.bind(rawDb),
++      exec: rawDb.exec.bind(rawDb),
++      checkRlsStatus: rawDb.checkRlsStatus.bind(rawDb),
++      close: rawDb.close.bind(rawDb),
++      transaction(fn, ctx) {
++        return rawDb.transaction(async (tx) => {
++          const wrappedTx = {
++            async query<R extends Record<string, unknown>>(sql: string, params?: unknown[]) {
++              if (failOnCompanyStateInsert && /INSERT INTO company_state/i.test(sql)) {
++                throw new Error('SIMULATED_MID_TX_DISK_ERROR');
++              }
++              return tx.query<R>(sql, params);
++            },
++            exec: tx.exec.bind(tx),
++          };
++          return fn(wrappedTx);
++        }, ctx);
++      },
++    };
++
++    srv = await startStagingServer(faultInjectedDb);
++    const { cookie: ownerCookie } = await bootstrapOwner(srv.baseUrl);
++
++    const seed = getInitialDatabase();
++    const rollbackCandidate = prepareDatabaseForRestore(
++      {
++        ...seed,
++        company: { ...seed.company, id: 'comp-rollback-test', nameAr: 'منشأة اختبار التراجع' },
++      },
++      'comp-rollback-test',
++      'restored_company'
++    );
++    // Re-stamp arrays for comp-rollback-test
++    const restamped = prepareDatabaseForRestore(rollbackCandidate, 'comp-rollback-test', 'current_company');
++    const { users: _u, companies: _c, ...statePayload } = restamped;
++
++    failOnCompanyStateInsert = true;
++    const failedRes = await fetch(`${srv.baseUrl}/api/company/restore`, {
++      method: 'POST',
++      headers: { 'Content-Type': 'application/json', Cookie: ownerCookie },
++      body: JSON.stringify({
++        targetMode: 'restored_company',
++        targetCompanyId: 'comp-rollback-test',
++        companyProfile: restamped.company,
++        state: statePayload,
++      }),
++    });
++    expect(failedRes.status).toBe(500);
++    failOnCompanyStateInsert = false;
++
++    // Verify full atomic rollback: ZERO rows committed for 'comp-rollback-test' across all tenant tables
++    const orphanCheck = await rawDb.transaction(
++      async (tx) => {
++        const comp = await tx.query('SELECT id FROM companies WHERE id = $1', ['comp-rollback-test']);
++        const mem = await tx.query('SELECT company_id FROM company_memberships WHERE company_id = $1', [
++          'comp-rollback-test',
++        ]);
++        const lic = await tx.query('SELECT company_id FROM company_licenses WHERE company_id = $1', [
++          'comp-rollback-test',
++        ]);
++        const st = await tx.query('SELECT company_id FROM company_state WHERE company_id = $1', [
++          'comp-rollback-test',
++        ]);
++        const log = await tx.query('SELECT company_id FROM company_audit_logs WHERE company_id = $1', [
++          'comp-rollback-test',
++        ]);
++        const usr = await tx.query<{ last_active_company_id: string }>(
++          'SELECT last_active_company_id FROM users WHERE id = $1',
++          ['usr-owner']
++        );
++        return {
++          comp: comp.rows.length,
++          mem: mem.rows.length,
++          lic: lic.rows.length,
++          st: st.rows.length,
++          log: log.rows.length,
++          lastActive: usr.rows[0]?.last_active_company_id,
++        };
++      },
++      { bypassRls: true }
++    );
++
++    expect(orphanCheck.comp).toBe(0);
++    expect(orphanCheck.mem).toBe(0);
++    expect(orphanCheck.lic).toBe(0);
++    expect(orphanCheck.st).toBe(0);
++    expect(orphanCheck.log).toBe(0);
++    expect(orphanCheck.lastActive).toBe('comp-01');
++  });
++});

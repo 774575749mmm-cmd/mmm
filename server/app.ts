@@ -31,8 +31,18 @@ export interface SessionPayload {
   isSuperAdmin?: boolean;
   companyId: string;
   allowedCompanyIds: string[];
+  sv?: number;
   iat: number;
   exp: number;
+}
+
+export function isSessionVersionValid(payloadSv: unknown, userSv: unknown): boolean {
+  const currentVersion = Math.max(1, Number(userSv ?? 1) || 1);
+  const tokenVersion = payloadSv === undefined || payloadSv === null ? 1 : Number(payloadSv);
+  if (!Number.isInteger(tokenVersion) || tokenVersion < 1) {
+    return false;
+  }
+  return tokenVersion === currentVersion;
 }
 
 export interface ServerRateLimits {
@@ -352,6 +362,24 @@ class AuthUserStore {
     return undefined;
   }
 
+  findByLoginIdentifier(identifier: string): ServerUserRecord | undefined {
+    const clean = identifier.trim();
+    if (!clean) return undefined;
+    const byUsername = this.findByUsername(clean);
+    if (byUsername) return byUsername;
+    if (clean.includes('@')) {
+      const target = clean.toLowerCase();
+      const matches: ServerUserRecord[] = [];
+      for (const u of this.users.values()) {
+        if ((u.email || '').trim().toLowerCase() === target) {
+          matches.push(u);
+        }
+      }
+      if (matches.length === 1) return matches[0];
+    }
+    return undefined;
+  }
+
   upsertUser(record: ServerUserRecord): void {
     this.users.set(record.id, { ...record });
     this.persist();
@@ -430,6 +458,7 @@ export async function ensureInitialOwnerFromEnv(
     username,
     fullName,
     email: String(env.ERP_BOOTSTRAP_ADMIN_EMAIL || `${username}@almansoor.erp`).trim(),
+    phone: String(env.ERP_BOOTSTRAP_ADMIN_PHONE || '').trim(),
     role: 'مالك المؤسسة',
     isSuperAdmin: true,
     allowedCompanyIds: [companyId],
@@ -438,6 +467,7 @@ export async function ensureInitialOwnerFromEnv(
     passwordHash: hash,
     passwordSalt: salt,
     mustChangePassword: false,
+    sessionVersion: 1,
     companyId,
     lastActiveCompanyId: companyId,
     flags: {
@@ -536,14 +566,17 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
     authUser?: ServerUserRecord;
   }
 
+  const getUserSessionVersion = (user: ServerUserRecord): number =>
+    Math.max(1, Number(user.sessionVersion ?? 1) || 1);
+
   const findUserByIdUnified = async (id: string): Promise<ServerUserRecord | undefined> => {
     if (pgRepo) return pgRepo.findUserById(id);
     return authStore!.findById(id);
   };
 
-  const findUserByUsernameUnified = async (username: string): Promise<ServerUserRecord | undefined> => {
-    if (pgRepo) return pgRepo.findUserByUsername(username);
-    return authStore!.findByUsername(username);
+  const findUserByLoginIdentifierUnified = async (identifier: string): Promise<ServerUserRecord | undefined> => {
+    if (pgRepo) return pgRepo.findUserByLoginIdentifier(identifier);
+    return authStore!.findByLoginIdentifier(identifier);
   };
 
   const hasAnyUsersUnified = async (): Promise<boolean> => {
@@ -581,6 +614,16 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
         return;
       }
 
+      if (!isSessionVersionValid(verified.payload.sv, storedUser.sessionVersion)) {
+        clearSessionCookie(req, res, isProduction);
+        res.status(401).json({
+          ok: false,
+          code: 'SESSION_REVOKED',
+          error: 'تم إنهاء هذه الجلسة بعد تغيير كلمة المرور أو إبطال الجلسات. يرجى تسجيل الدخول مجدداً.',
+        });
+        return;
+      }
+
       // Derive authoritative company memberships from PostgreSQL, never trust stale cookie claims alone
       const authoritativeAllowed = Array.isArray(storedUser.allowedCompanyIds)
         ? storedUser.allowedCompanyIds
@@ -599,6 +642,7 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
         isSuperAdmin: Boolean(storedUser.isSuperAdmin),
         companyId: effectiveCompanyId,
         allowedCompanyIds: authoritativeAllowed,
+        sv: getUserSessionVersion(storedUser),
       };
       req.authUser = storedUser;
       next();
@@ -707,37 +751,43 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
       let activeCompanyId: string | null = null;
       let companies: unknown[] = [];
       let licenseBoundary = evaluateLicenseBoundary(null);
+      let sessionRevoked = false;
 
       if (token) {
         const verified = verifySessionToken(token);
         if (verified.valid) {
           const u = await findUserByIdUnified(verified.payload.userId);
           if (u && u.active) {
-            activeUser = sanitizePublicUser(u);
-            if (pgRepo) {
-              const authCompanies = await pgRepo.getUserAuthorizedCompanies(u.id);
-              const allowedSet = new Set(authCompanies.map((c) => c.id));
-              activeCompanyId =
-                (verified.payload.companyId && allowedSet.has(verified.payload.companyId)
-                  ? verified.payload.companyId
-                  : null) ||
-                (u.lastActiveCompanyId && allowedSet.has(u.lastActiveCompanyId)
-                  ? u.lastActiveCompanyId
-                  : null) ||
-                u.companyId ||
-                authCompanies[0]?.id ||
-                null;
-              companies = u.isSuperAdmin
-                ? authCompanies
-                : authCompanies.filter((c) => c.id === activeCompanyId);
-              if (activeCompanyId) {
-                const st = await pgRepo.getCompanyState(u.id, activeCompanyId);
-                if (st.ok) {
-                  licenseBoundary = evaluateLicenseBoundary(st.snapshot.license);
-                }
-              }
+            if (!isSessionVersionValid(verified.payload.sv, u.sessionVersion)) {
+              sessionRevoked = true;
+              clearSessionCookie(req, res, isProduction);
             } else {
-              activeCompanyId = verified.payload.companyId || u.allowedCompanyIds[0] || null;
+              activeUser = sanitizePublicUser(u);
+              if (pgRepo) {
+                const authCompanies = await pgRepo.getUserAuthorizedCompanies(u.id);
+                const allowedSet = new Set(authCompanies.map((c) => c.id));
+                activeCompanyId =
+                  (verified.payload.companyId && allowedSet.has(verified.payload.companyId)
+                    ? verified.payload.companyId
+                    : null) ||
+                  (u.lastActiveCompanyId && allowedSet.has(u.lastActiveCompanyId)
+                    ? u.lastActiveCompanyId
+                    : null) ||
+                  u.companyId ||
+                  authCompanies[0]?.id ||
+                  null;
+                companies = u.isSuperAdmin
+                  ? authCompanies
+                  : authCompanies.filter((c) => c.id === activeCompanyId);
+                if (activeCompanyId) {
+                  const st = await pgRepo.getCompanyState(u.id, activeCompanyId);
+                  if (st.ok) {
+                    licenseBoundary = evaluateLicenseBoundary(st.snapshot.license);
+                  }
+                }
+              } else {
+                activeCompanyId = verified.payload.companyId || u.allowedCompanyIds[0] || null;
+              }
             }
           }
         }
@@ -748,6 +798,7 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
         ok: true,
         initialized,
         authenticated: Boolean(activeUser),
+        sessionRevoked,
         user: activeUser,
         companies,
         activeCompanyId,
@@ -778,6 +829,7 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
         username?: string;
         fullName?: string;
         email?: string;
+        phone?: string;
         allowedCompanyIds?: string[];
         branchId?: string;
         password?: string;
@@ -811,6 +863,7 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
         username,
         fullName,
         email: String(body.email || `${username}@almansoor.erp`).trim(),
+        phone: String(body.phone || '').trim(),
         role: 'مالك المؤسسة',
         isSuperAdmin: true,
         allowedCompanyIds,
@@ -819,6 +872,8 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
         passwordHash: hash,
         passwordSalt: salt,
         mustChangePassword: false,
+        sessionVersion: 1,
+        passwordChangedAt: new Date().toISOString(),
         lastActiveCompanyId: allowedCompanyIds[0] || 'comp-01',
         flags: {
           canViewReports: true,
@@ -836,6 +891,7 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
       };
 
       let createdCompanies: unknown[] = [];
+      let persistedOwner: ServerUserRecord = ownerRecord;
       if (pgRepo) {
         const companyInputs = allowedCompanyIds.map((cid, idx) => ({
           id: cid,
@@ -854,6 +910,7 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
           return;
         }
         createdCompanies = bootRes.companies;
+        persistedOwner = bootRes.user;
       } else {
         authStore!.upsertUser(ownerRecord);
       }
@@ -861,12 +918,13 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
       const now = Date.now();
       const activeCompanyId = allowedCompanyIds[0] || 'comp-01';
       const token = signSessionToken({
-        userId: ownerRecord.id,
-        username: ownerRecord.username,
-        role: ownerRecord.role,
+        userId: persistedOwner.id,
+        username: persistedOwner.username,
+        role: persistedOwner.role,
         isSuperAdmin: true,
         companyId: activeCompanyId,
         allowedCompanyIds,
+        sv: getUserSessionVersion(persistedOwner),
         iat: now,
         exp: now + SESSION_TTL_MS,
       });
@@ -874,7 +932,7 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
       setSessionCookie(req, res, token, isProduction);
       res.status(201).json({
         ok: true,
-        user: sanitizePublicUser(ownerRecord),
+        user: sanitizePublicUser(persistedOwner),
         companies: createdCompanies,
         activeCompanyId,
         licenseBoundary: evaluateLicenseBoundary(null),
@@ -904,6 +962,7 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
         username?: string;
         fullName?: string;
         email?: string;
+        phone?: string;
         password?: string;
         company?: {
           id?: string;
@@ -926,12 +985,21 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
       const username = String(body.username || '').trim();
       const fullName = String(body.fullName || '').trim();
       const password = String(body.password || '');
+      const companyNameAr = String(body.company?.nameAr || '').trim();
 
       if (!username || !fullName) {
         res.status(400).json({
           ok: false,
           code: 'MISSING_FIELDS',
           error: 'يرجى إدخال اسم المستخدم والاسم الكامل.',
+        });
+        return;
+      }
+      if (!companyNameAr) {
+        res.status(400).json({
+          ok: false,
+          code: 'COMPANY_NAME_REQUIRED',
+          error: 'اسم المنشأة الجديدة بالعربية مطلوب لإنشاء الحساب وربطه بالمنشأة.',
         });
         return;
       }
@@ -946,15 +1014,13 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
         username,
         fullName,
         email: body.email,
+        phone: body.phone || body.company?.phone,
         passwordHash: hash,
         passwordSalt: salt,
-        company:
-          body.company && body.company.nameAr && body.company.nameAr.trim()
-            ? {
-                ...body.company,
-                nameAr: body.company.nameAr.trim(),
-              }
-            : undefined,
+        company: {
+          ...body.company,
+          nameAr: companyNameAr,
+        },
         initialState: body.initialState,
       });
 
@@ -968,20 +1034,19 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
       }
 
       const now = Date.now();
-      const activeCompanyId = regRes.company?.id || null;
-      if (activeCompanyId) {
-        const token = signSessionToken({
-          userId: regRes.user.id,
-          username: regRes.user.username,
-          role: regRes.user.role,
-          isSuperAdmin: false,
-          companyId: activeCompanyId,
-          allowedCompanyIds: [activeCompanyId],
-          iat: now,
-          exp: now + SESSION_TTL_MS,
-        });
-        setSessionCookie(req, res, token, isProduction);
-      }
+      const activeCompanyId = regRes.company.id;
+      const token = signSessionToken({
+        userId: regRes.user.id,
+        username: regRes.user.username,
+        role: regRes.user.role,
+        isSuperAdmin: false,
+        companyId: activeCompanyId,
+        allowedCompanyIds: [activeCompanyId],
+        sv: getUserSessionVersion(regRes.user),
+        iat: now,
+        exp: now + SESSION_TTL_MS,
+      });
+      setSessionCookie(req, res, token, isProduction);
 
       res.status(201).json({
         ok: true,
@@ -1000,31 +1065,32 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
     }
   });
 
-  // Real Password-Verified Login
+  // Real Password-Verified Login (supports username or unique registered email)
   app.post('/api/auth/login', loginRateLimiter, async (req: Request, res: Response) => {
     try {
       const body = (req.body || {}) as {
         username?: string;
+        identifier?: string;
         userId?: string;
         password?: string;
         companyId?: string;
       };
-      const username = String(body.username || '').trim();
+      const identifier = String(body.username || body.identifier || '').trim();
       const userId = String(body.userId || '').trim();
       const password = String(body.password || '');
 
-      if ((!username && !userId) || !password) {
+      if ((!identifier && !userId) || !password) {
         res.status(400).json({
           ok: false,
           code: 'MISSING_CREDENTIALS',
-          error: 'يرجى إدخال اسم المستخدم وكلمة المرور.',
+          error: 'يرجى إدخال اسم المستخدم أو البريد الإلكتروني وكلمة المرور.',
         });
         return;
       }
 
       const record = userId
         ? await findUserByIdUnified(userId)
-        : await findUserByUsernameUnified(username);
+        : await findUserByLoginIdentifierUnified(identifier);
 
       if (!record) {
         res.status(401).json({
@@ -1092,6 +1158,7 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
         isSuperAdmin: Boolean(record.isSuperAdmin),
         companyId: activeCompanyId,
         allowedCompanyIds: allowedCompanies,
+        sv: getUserSessionVersion(record),
         iat: now,
         exp: now + SESSION_TTL_MS,
       });
@@ -1254,6 +1321,7 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
           isSuperAdmin: Boolean(actor.isSuperAdmin),
           companyId: createRes.company.id,
           allowedCompanyIds: allowedIds,
+          sv: getUserSessionVersion(actor),
           iat: now,
           exp: now + SESSION_TTL_MS,
         });
@@ -1449,6 +1517,7 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
           isSuperAdmin: Boolean(actor.isSuperAdmin),
           companyId: switchRes.company.id,
           allowedCompanyIds: allowedIds,
+          sv: getUserSessionVersion(actor),
           iat: now,
           exp: now + SESSION_TTL_MS,
         });
@@ -1593,6 +1662,140 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
     }
   });
 
+  app.post(
+    '/api/company/restore',
+    requireAuth,
+    requireRoles(ADMIN_ROLES),
+    async (req: AuthenticatedRequest, res: Response) => {
+      try {
+        if (!pgRepo) {
+          res.status(501).json({
+            ok: false,
+            code: 'POSTGRES_REQUIRED',
+            error: 'استعادة النسخة الاحتياطية وحفظها تتطلب قاعدة بيانات PostgreSQL.',
+          });
+          return;
+        }
+        const actor = req.authUser!;
+        const sessionCompanyId = req.authSession?.companyId || '';
+        if (!sessionCompanyId) {
+          res.status(403).json({
+            ok: false,
+            code: 'NO_COMPANY_ACCESS',
+            error: 'عذراً، هذا الحساب لا يملك منشأة نشطة مصرح بها.',
+          });
+          return;
+        }
+
+        const headerCid = String(req.headers['x-company-id'] || '').trim();
+        if (headerCid && headerCid !== sessionCompanyId) {
+          res.status(403).json({
+            ok: false,
+            code: 'TENANT_ISOLATION_VIOLATION',
+            error: 'عزل المنشآت: معرف المنشأة في الترويسة مخالف للجلسة الموثقة.',
+          });
+          return;
+        }
+
+        const body = (req.body || {}) as {
+          targetMode?: string;
+          targetCompanyId?: string;
+          companyProfile?: Record<string, unknown>;
+          state?: Record<string, unknown>;
+          expectedRevision?: number;
+          allowReplaceExisting?: boolean;
+          sourceLabel?: string;
+        };
+
+        const targetMode =
+          body.targetMode === 'restored_company'
+            ? 'restored_company'
+            : body.targetMode === 'current_company' || !body.targetMode
+            ? 'current_company'
+            : null;
+
+        if (!targetMode) {
+          res.status(400).json({
+            ok: false,
+            code: 'INVALID_RESTORE_MODE',
+            error: 'وضع استعادة النسخة غير صالح (المسموح: current_company أو restored_company).',
+          });
+          return;
+        }
+
+        if (targetMode === 'restored_company' && !actor.isSuperAdmin) {
+          res.status(403).json({
+            ok: false,
+            code: 'FORBIDDEN_SUPER_ADMIN_ONLY',
+            error: 'صلاحية مرفوضة: إنشاء مؤسسة مستقلة من النسخة الاحتياطية مخصص لمالك المؤسسة (Super Admin) فقط.',
+          });
+          return;
+        }
+
+        if (!body.state || typeof body.state !== 'object' || Array.isArray(body.state)) {
+          res.status(400).json({
+            ok: false,
+            code: 'INVALID_BACKUP_PAYLOAD',
+            error: 'بيانات النسخة الاحتياطية غير صالحة أو مفقودة.',
+          });
+          return;
+        }
+
+        const restoreRes = await pgRepo.restoreCompanyBackup({
+          actor,
+          sessionCompanyId,
+          targetMode,
+          targetCompanyId: body.targetCompanyId ? String(body.targetCompanyId).trim() : undefined,
+          companyProfile: body.companyProfile as Record<string, unknown> | undefined,
+          state: body.state,
+          expectedRevision:
+            typeof body.expectedRevision === 'number' ? body.expectedRevision : undefined,
+          allowReplaceExisting: Boolean(body.allowReplaceExisting),
+          sourceLabel: body.sourceLabel ? String(body.sourceLabel).slice(0, 120) : undefined,
+        });
+
+        if (!restoreRes.ok) {
+          res.status(restoreRes.status).json({
+            ok: false,
+            code: restoreRes.code,
+            error: restoreRes.error,
+            serverRevision: restoreRes.serverRevision,
+          });
+          return;
+        }
+
+        const now = Date.now();
+        const allowedIds = restoreRes.companies.map((c) => c.id);
+        const token = signSessionToken({
+          userId: actor.id,
+          username: actor.username,
+          role: actor.role,
+          isSuperAdmin: Boolean(actor.isSuperAdmin),
+          companyId: restoreRes.activeCompanyId,
+          allowedCompanyIds: allowedIds,
+          sv: getUserSessionVersion(actor),
+          iat: now,
+          exp: now + SESSION_TTL_MS,
+        });
+        setSessionCookie(req, res, token, isProduction);
+
+        res.json({
+          ok: true,
+          company: restoreRes.company,
+          companies: restoreRes.companies,
+          activeCompanyId: restoreRes.activeCompanyId,
+          revision: restoreRes.revision,
+          licenseBoundary: evaluateLicenseBoundary(restoreRes.license),
+        });
+      } catch (err) {
+        res.status(500).json({
+          ok: false,
+          error: err instanceof Error ? err.message : 'Failed restoring company backup',
+        });
+      }
+    }
+  );
+
   // Tenant-Scoped User Management (strictly restricted to active session companyId)
   app.get('/api/company/users', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
     try {
@@ -1626,6 +1829,7 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
         username?: string;
         fullName?: string;
         email?: string;
+        phone?: string;
         role?: string;
         isSuperAdmin?: boolean;
         allowedCompanyIds?: string[];
@@ -1698,6 +1902,7 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
             username,
             fullName,
             email: body.email,
+            phone: body.phone,
             role,
             isSuperAdmin: Boolean(req.authUser?.isSuperAdmin && body.isSuperAdmin),
             allowedCompanyIds: body.allowedCompanyIds,
@@ -1729,8 +1934,23 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
 
       // In-memory store path (preserves legacy unit tests cleanly)
       const existing = authStore!.findById(id);
+      if (
+        existing &&
+        (existing.isSuperAdmin || existing.role === 'مالك المؤسسة') &&
+        !req.authUser?.isSuperAdmin
+      ) {
+        res.status(403).json({
+          ok: false,
+          code: 'FORBIDDEN_SUPER_ADMIN_PROTECTION',
+          error:
+            'صلاحية مرفوضة: لا يملك مدير المنشأة صلاحية تعديل أو تعطيل أو تغيير كلمة مرور حساب مدير النظام الأعلى (Super Admin).',
+        });
+        return;
+      }
+
       let passwordHash = existing?.passwordHash || '';
       let passwordSalt = existing?.passwordSalt || '';
+      let passwordChanged = false;
 
       if (body.password !== undefined && body.password !== '') {
         const strength = validatePasswordStrengthServer(String(body.password));
@@ -1741,6 +1961,7 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
         const hashed = hashPasswordPbkdf2Server(String(body.password));
         passwordHash = hashed.hash;
         passwordSalt = hashed.salt;
+        passwordChanged = Boolean(existing);
       } else if (!existing) {
         res.status(400).json({
           ok: false,
@@ -1778,21 +1999,32 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
         return;
       }
 
+      const nextActive = body.active !== undefined ? Boolean(body.active) : existing?.active !== false;
+      const prevSv = existing ? getUserSessionVersion(existing) : 1;
+      const shouldBumpSv = Boolean(existing && (passwordChanged || (!nextActive && existing.active)));
+      const nextSessionVersion = shouldBumpSv ? prevSv + 1 : prevSv;
+
       const nextRecord: ServerUserRecord = {
         id,
         username,
         fullName,
+        email: body.email !== undefined ? String(body.email).trim() : existing?.email || '',
+        phone: body.phone !== undefined ? String(body.phone).trim() : existing?.phone || '',
         role,
-        isSuperAdmin: Boolean(req.authUser?.isSuperAdmin && body.isSuperAdmin),
+        isSuperAdmin: existing
+          ? Boolean(existing.isSuperAdmin)
+          : Boolean(req.authUser?.isSuperAdmin && body.isSuperAdmin),
         allowedCompanyIds: nextAllowedCompanyIds,
         branchId: String(body.branchId || existing?.branchId || 'br-01').trim(),
-        active: body.active !== undefined ? Boolean(body.active) : existing?.active !== false,
+        active: nextActive,
         passwordHash,
         passwordSalt,
         mustChangePassword:
           body.mustChangePassword !== undefined
             ? Boolean(body.mustChangePassword)
             : Boolean(existing?.mustChangePassword),
+        sessionVersion: nextSessionVersion,
+        passwordChangedAt: passwordChanged || !existing ? new Date().toISOString() : existing?.passwordChangedAt ?? null,
         updatedAt: new Date().toISOString(),
       };
 
@@ -1820,7 +2052,7 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
       const newPassword = String(body.newPassword || '');
 
       if (!verifyPasswordServer(currentPassword, user.passwordHash, user.passwordSalt)) {
-        res.status(401).json({ ok: false, error: 'كلمة المرور الحالية غير صحيحة.' });
+        res.status(401).json({ ok: false, code: 'INVALID_CURRENT_PASSWORD', error: 'كلمة المرور الحالية غير صحيحة.' });
         return;
       }
       const strength = validatePasswordStrengthServer(newPassword);
@@ -1830,30 +2062,207 @@ export function createErpServerApp(options: ServerAppOptions = {}): Express {
       }
 
       const hashed = hashPasswordPbkdf2Server(newPassword);
+      const nowIso = new Date().toISOString();
+      let nextSessionVersion = getUserSessionVersion(user) + 1;
+
       if (pgRepo) {
-        await pgRepo.updateUserPassword(user.id, hashed.hash, hashed.salt);
+        const upd = await pgRepo.updateUserPassword(user.id, hashed.hash, hashed.salt, {
+          companyId: req.authSession?.companyId || user.lastActiveCompanyId || undefined,
+          actorUserId: user.id,
+          actorName: user.fullName,
+          auditDetails: 'تغيير كلمة المرور الذاتي وإبطال جميع الجلسات السابقة',
+        });
+        nextSessionVersion = upd.sessionVersion;
       } else {
         authStore!.upsertUser({
           ...user,
           passwordHash: hashed.hash,
           passwordSalt: hashed.salt,
           mustChangePassword: false,
-          updatedAt: new Date().toISOString(),
+          sessionVersion: nextSessionVersion,
+          passwordChangedAt: nowIso,
+          updatedAt: nowIso,
         });
       }
 
+      const now = Date.now();
+      const activeCompanyId = req.authSession?.companyId || user.lastActiveCompanyId || user.allowedCompanyIds[0] || '';
+      const refreshedToken = signSessionToken({
+        userId: user.id,
+        username: user.username,
+        role: user.role,
+        isSuperAdmin: Boolean(user.isSuperAdmin),
+        companyId: activeCompanyId,
+        allowedCompanyIds: req.authSession?.allowedCompanyIds || user.allowedCompanyIds,
+        sv: nextSessionVersion,
+        iat: now,
+        exp: now + SESSION_TTL_MS,
+      });
+      setSessionCookie(req, res, refreshedToken, isProduction);
+
       res.json({
         ok: true,
+        revokedPreviousSessions: true,
         user: sanitizePublicUser({
           ...user,
           mustChangePassword: false,
-          updatedAt: new Date().toISOString(),
+          sessionVersion: nextSessionVersion,
+          passwordChangedAt: nowIso,
+          updatedAt: nowIso,
         }),
       });
     } catch (err) {
       res.status(500).json({
         ok: false,
         error: err instanceof Error ? err.message : 'Password change failed',
+      });
+    }
+  });
+
+  // Mandatory First-Login / Admin-Reset Forced Password Completion (ALL authenticated roles)
+  app.post('/api/auth/complete-forced-password-change', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const user = req.authUser!;
+      if (!user.mustChangePassword) {
+        res.status(409).json({
+          ok: false,
+          code: 'PASSWORD_CHANGE_NOT_REQUIRED',
+          error: 'هذا الحساب لا يتطلب تغيير كلمة المرور الإلزامي حالياً.',
+        });
+        return;
+      }
+
+      const body = (req.body || {}) as { newPassword?: string };
+      const newPassword = String(body.newPassword || '');
+      const strength = validatePasswordStrengthServer(newPassword);
+      if (!strength.ok) {
+        res.status(400).json({ ok: false, code: 'WEAK_PASSWORD', error: strength.error });
+        return;
+      }
+
+      if (verifyPasswordServer(newPassword, user.passwordHash, user.passwordSalt)) {
+        res.status(400).json({
+          ok: false,
+          code: 'SAME_PASSWORD_NOT_ALLOWED',
+          error: 'يجب اختيار كلمة مرور جديدة مختلفة عن كلمة المرور المؤقتة الحالية.',
+        });
+        return;
+      }
+
+      const hashed = hashPasswordPbkdf2Server(newPassword);
+      const nowIso = new Date().toISOString();
+      let nextSessionVersion = getUserSessionVersion(user) + 1;
+
+      if (pgRepo) {
+        const upd = await pgRepo.updateUserPassword(user.id, hashed.hash, hashed.salt, {
+          companyId: req.authSession?.companyId || user.lastActiveCompanyId || undefined,
+          actorUserId: user.id,
+          actorName: user.fullName,
+          auditDetails: 'إتمام تغيير كلمة المرور الإلزامي وتجديد الجلسة بنجاح',
+        });
+        nextSessionVersion = upd.sessionVersion;
+      } else {
+        authStore!.upsertUser({
+          ...user,
+          passwordHash: hashed.hash,
+          passwordSalt: hashed.salt,
+          mustChangePassword: false,
+          sessionVersion: nextSessionVersion,
+          passwordChangedAt: nowIso,
+          updatedAt: nowIso,
+        });
+      }
+
+      const now = Date.now();
+      const activeCompanyId = req.authSession?.companyId || user.lastActiveCompanyId || user.allowedCompanyIds[0] || '';
+      const refreshedToken = signSessionToken({
+        userId: user.id,
+        username: user.username,
+        role: user.role,
+        isSuperAdmin: Boolean(user.isSuperAdmin),
+        companyId: activeCompanyId,
+        allowedCompanyIds: req.authSession?.allowedCompanyIds || user.allowedCompanyIds,
+        sv: nextSessionVersion,
+        iat: now,
+        exp: now + SESSION_TTL_MS,
+      });
+      setSessionCookie(req, res, refreshedToken, isProduction);
+
+      res.json({
+        ok: true,
+        activeCompanyId,
+        revokedPreviousSessions: true,
+        user: sanitizePublicUser({
+          ...user,
+          mustChangePassword: false,
+          sessionVersion: nextSessionVersion,
+          passwordChangedAt: nowIso,
+          updatedAt: nowIso,
+        }),
+      });
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Forced password change failed',
+      });
+    }
+  });
+
+  // Explicit Session Revocation (revokes all other active sessions; optionally keeps current session)
+  app.post('/api/auth/revoke-sessions', requireAuth, async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const user = req.authUser!;
+      const body = (req.body || {}) as { keepCurrent?: boolean };
+      const keepCurrent = body.keepCurrent !== false;
+      const nowIso = new Date().toISOString();
+      let nextSessionVersion = getUserSessionVersion(user) + 1;
+
+      if (pgRepo) {
+        const upd = await pgRepo.incrementSessionVersion(user.id, {
+          companyId: req.authSession?.companyId || user.lastActiveCompanyId || undefined,
+          actorUserId: user.id,
+          actorName: user.fullName,
+          auditDetails: keepCurrent
+            ? 'إبطال جميع جلسات الدخول على الأجهزة الأخرى مع الإبقاء على الجلسة الحالية'
+            : 'إبطال جميع جلسات الدخول النشطة بما فيها الجلسة الحالية',
+        });
+        nextSessionVersion = upd.sessionVersion;
+      } else {
+        authStore!.upsertUser({
+          ...user,
+          sessionVersion: nextSessionVersion,
+          updatedAt: nowIso,
+        });
+      }
+
+      if (keepCurrent) {
+        const now = Date.now();
+        const activeCompanyId = req.authSession?.companyId || user.lastActiveCompanyId || user.allowedCompanyIds[0] || '';
+        const refreshedToken = signSessionToken({
+          userId: user.id,
+          username: user.username,
+          role: user.role,
+          isSuperAdmin: Boolean(user.isSuperAdmin),
+          companyId: activeCompanyId,
+          allowedCompanyIds: req.authSession?.allowedCompanyIds || user.allowedCompanyIds,
+          sv: nextSessionVersion,
+          iat: now,
+          exp: now + SESSION_TTL_MS,
+        });
+        setSessionCookie(req, res, refreshedToken, isProduction);
+      } else {
+        clearSessionCookie(req, res, isProduction);
+      }
+
+      res.json({
+        ok: true,
+        sessionVersion: nextSessionVersion,
+        keptCurrentSession: keepCurrent,
+      });
+    } catch (err) {
+      res.status(500).json({
+        ok: false,
+        error: err instanceof Error ? err.message : 'Session revocation failed',
       });
     }
   });

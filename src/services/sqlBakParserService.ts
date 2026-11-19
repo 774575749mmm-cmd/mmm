@@ -59,7 +59,7 @@ export interface ParsedBakDatabase {
   applyQrightMigration: (
     currentDb: ERPDatabase,
     mode: 'merge' | 'replace',
-    options: { includeCompany: boolean; includeRecentInvoices: boolean }
+    options: { includeCompany: boolean; includeRecentInvoices: boolean; targetCompanyId?: string }
   ) => { updatedDb: ERPDatabase; stats: QrightMigrationStats };
 }
 
@@ -612,12 +612,16 @@ export function parseSqlServerBakBuffer(buffer: ArrayBuffer, fileName: string): 
   const applyQrightMigration = (
     currentDb: ERPDatabase,
     mode: 'merge' | 'replace',
-    options: { includeCompany: boolean; includeRecentInvoices: boolean }
+    options: { includeCompany: boolean; includeRecentInvoices: boolean; targetCompanyId?: string }
   ): { updatedDb: ERPDatabase; stats: QrightMigrationStats } => {
     const now = new Date().toISOString();
     const today = now.split('T')[0];
     const ZERO_GUID = '00000000-0000-0000-0000-000000000000';
     let updatedDb: ERPDatabase = { ...currentDb };
+    const shouldSwitchCompanyIdentity = mode === 'replace' || options.includeCompany;
+    const resolvedCompanyId =
+      String(options.targetCompanyId || '').trim() ||
+      (shouldSwitchCompanyIdentity ? 'comp-bak-1' : currentDb.activeCompanyId || currentDb.company.id);
 
     // 1. Currencies (resolve base currency first for company profile; handle Arabic Alef Maqsura & inverted rates)
     const currRows = decodeTable('Currency', 20);
@@ -689,6 +693,7 @@ export function parseSqlServerBakBuffer(buffer: ArrayBuffer, fileName: string): 
           fullName,
           role: isAdmin ? 'مالك المؤسسة' : 'محاسب',
           branchId: 'br-bak-1',
+          allowedCompanyIds: [resolvedCompanyId],
           email: u.Email ? String(u.Email) : '',
           active: u.IsView !== false,
           canViewReports: true,
@@ -708,7 +713,7 @@ export function parseSqlServerBakBuffer(buffer: ArrayBuffer, fileName: string): 
       .filter((b) => String(b.Name || '').trim() !== '')
       .map((b, idx) => ({
         id: `br-bak-${b.Number || idx + 1}`,
-        companyId: 'comp-bak-1',
+        companyId: resolvedCompanyId,
         code: String(b.Code || `BR-${idx + 1}`).trim(),
         nameAr: String(b.Name || dbName).trim(),
         phone: String(b.Phone || b.Mobile || '').trim(),
@@ -721,38 +726,86 @@ export function parseSqlServerBakBuffer(buffer: ArrayBuffer, fileName: string): 
     if (mappedBranches.length > 0) {
       if (mode === 'replace') {
         updatedDb.branches = mappedBranches;
-        updatedDb.users = updatedDb.users.map((u) => ({ ...u, branchId: mappedBranches[0].id }));
+        updatedDb.users = updatedDb.users.map((u) => ({
+          ...u,
+          branchId: mappedBranches[0].id,
+          allowedCompanyIds: [resolvedCompanyId],
+        }));
       } else if (options.includeCompany) {
         const mergedBr = [...currentDb.branches];
         mappedBranches.forEach((b) => {
-          if (!mergedBr.some((x) => x.code === b.code || x.nameAr === b.nameAr)) {
+          if (!mergedBr.some((x) => x.companyId === resolvedCompanyId && (x.code === b.code || x.nameAr === b.nameAr))) {
             mergedBr.push(b);
           }
         });
         updatedDb.branches = mergedBr;
       }
+    } else if (mode === 'replace') {
+      updatedDb.branches = [
+        {
+          id: `br-${resolvedCompanyId}`,
+          companyId: resolvedCompanyId,
+          code: 'BR-01',
+          nameAr: String(dbName || currentDb.company.nameAr || 'الفرع الرئيسي').trim(),
+          phone: currentDb.company.phone || '',
+          address: currentDb.company.address || '',
+          managerName: updatedDb.users[0]?.fullName || 'الإدارة',
+          isMain: true,
+          status: 'active',
+        },
+      ];
     }
 
-    if ((mode === 'replace' || options.includeCompany) && branchRows.length > 0) {
-      const b0 = branchRows[0];
-      const compAddr = [b0.Address, b0.StreetName, b0.District, b0.City, b0.Country]
-        .filter(Boolean)
-        .map(String)
-        .join(' - ');
-      const latin = b0.LatinName && b0.LatinName !== 'Company Name' ? String(b0.LatinName).trim() : '';
-      updatedDb.company = {
-        id: 'comp-bak-1',
-        nameAr: String(b0.Name || dbName).trim(),
-        nameEn: latin || String(b0.Name || dbName).trim(),
-        commercialRecord: String(b0.CommercialRegistry || '').trim(),
-        taxNumber: String(b0.TaxNumber || b0.VatNumber || '').trim(),
-        phone: String(b0.Phone || b0.Mobile || '').trim(),
-        email: String(b0.Email || '').trim(),
-        address: compAddr,
-        baseCurrency: baseCurrCode,
-      };
+    if (shouldSwitchCompanyIdentity) {
+      if (branchRows.length > 0) {
+        const b0 = branchRows[0];
+        const compAddr = [b0.Address, b0.StreetName, b0.District, b0.City, b0.Country]
+          .filter(Boolean)
+          .map(String)
+          .join(' - ');
+        const latin = b0.LatinName && b0.LatinName !== 'Company Name' ? String(b0.LatinName).trim() : '';
+        updatedDb.company = {
+          id: resolvedCompanyId,
+          nameAr: String(b0.Name || dbName).trim(),
+          nameEn: latin || String(b0.Name || dbName).trim(),
+          commercialRecord: String(b0.CommercialRegistry || '').trim(),
+          taxNumber: String(b0.TaxNumber || b0.VatNumber || '').trim(),
+          phone: String(b0.Phone || b0.Mobile || '').trim(),
+          email: String(b0.Email || '').trim(),
+          address: compAddr,
+          baseCurrency: baseCurrCode,
+          countryCode: currentDb.company?.countryCode || 'YE',
+          isActive: true,
+          valuationPolicy: currentDb.company?.valuationPolicy || 'PER_ITEM',
+        };
+      } else {
+        updatedDb.company = {
+          ...currentDb.company,
+          id: resolvedCompanyId,
+          nameAr: String(dbName || currentDb.company.nameAr).trim(),
+          nameEn: String(dbName || currentDb.company.nameEn || currentDb.company.nameAr).trim(),
+          baseCurrency: baseCurrCode,
+          isActive: true,
+        };
+      }
+      updatedDb.activeCompanyId = resolvedCompanyId;
+      if (mode === 'replace') {
+        updatedDb.companies = [updatedDb.company];
+      } else {
+        const existingCompanies = currentDb.companies && currentDb.companies.length > 0 ? [...currentDb.companies] : [currentDb.company];
+        const idx = existingCompanies.findIndex((c) => c.id === resolvedCompanyId);
+        updatedDb.companies =
+          idx >= 0
+            ? existingCompanies.map((c, i) => (i === idx ? updatedDb.company : c))
+            : [...existingCompanies, updatedDb.company];
+      }
+    } else {
+      updatedDb.activeCompanyId = resolvedCompanyId;
     }
-    const branchId = updatedDb.branches[0]?.id || 'br-1';
+    const branchId =
+      updatedDb.branches.find((b) => b.companyId === resolvedCompanyId)?.id ||
+      updatedDb.branches[0]?.id ||
+      `br-${resolvedCompanyId}`;
 
     // 4. Regional Areas (strictly from Addy hierarchy + distinct Customer City/Address)
     const addyRows = userTablesByName.has('Addy') ? decodeTable('Addy', 2000) : [];
@@ -1849,6 +1902,7 @@ export function parseSqlServerBakBuffer(buffer: ArrayBuffer, fileName: string): 
 
     const migrationLog = {
       id: `log-bak-${Date.now()}`,
+      companyId: resolvedCompanyId,
       timestamp: now,
       userId: updatedDb.users[0]?.id || 'u-1',
       userName: updatedDb.users[0]?.fullName || 'الإدارة',
@@ -1857,6 +1911,65 @@ export function parseSqlServerBakBuffer(buffer: ArrayBuffer, fileName: string): 
       details: `استيراد شامل من نسخة SQL Server (${fileName}): ${stats.accountsImported} حساب، ${stats.customersImported} عميل، ${stats.itemsImported} صنف، ${stats.invoicesImported} فاتورة، ${stats.vouchersImported} سند، ${stats.journalEntriesImported} قيد، ${mappedRegionalAreas.length} منطقة`,
     };
     updatedDb.auditLogs = mode === 'replace' ? [migrationLog] : [migrationLog, ...currentDb.auditLogs];
+
+    const stampTargetCompany = <T extends object>(items: T[] | undefined): (T & { companyId: string })[] =>
+      Array.isArray(items)
+        ? items.map((item) => {
+            const existing = (item as { companyId?: string }).companyId;
+            if (mode === 'replace') {
+              return { ...item, companyId: resolvedCompanyId };
+            }
+            return existing && String(existing).trim()
+              ? { ...item, companyId: String(existing) }
+              : { ...item, companyId: resolvedCompanyId };
+          })
+        : [];
+
+    updatedDb = {
+      ...updatedDb,
+      activeCompanyId: resolvedCompanyId,
+      branches: stampTargetCompany(updatedDb.branches),
+      warehouses: stampTargetCompany(updatedDb.warehouses),
+      departments: stampTargetCompany(updatedDb.departments),
+      customers: stampTargetCompany(updatedDb.customers),
+      vendors: stampTargetCompany(updatedDb.vendors),
+      inventoryItems: stampTargetCompany(updatedDb.inventoryItems),
+      warehouseStock: stampTargetCompany(updatedDb.warehouseStock),
+      stockCostLayers: stampTargetCompany(updatedDb.stockCostLayers),
+      inventoryBatches: stampTargetCompany(updatedDb.inventoryBatches),
+      storageLocations: stampTargetCompany(updatedDb.storageLocations),
+      stockMovements: stampTargetCompany(updatedDb.stockMovements),
+      inventoryTransfers: stampTargetCompany(updatedDb.inventoryTransfers),
+      stocktakings: stampTargetCompany(updatedDb.stocktakings),
+      warehouseDocuments: stampTargetCompany(updatedDb.warehouseDocuments),
+      documentBooks: stampTargetCompany(updatedDb.documentBooks),
+      chartOfAccounts: stampTargetCompany(updatedDb.chartOfAccounts),
+      costCenters: stampTargetCompany(updatedDb.costCenters),
+      journalEntries: stampTargetCompany(updatedDb.journalEntries),
+      fiscalPeriods: stampTargetCompany(updatedDb.fiscalPeriods),
+      invoices: stampTargetCompany(updatedDb.invoices),
+      commercialOrders: stampTargetCompany(updatedDb.commercialOrders),
+      treasuryAccounts: stampTargetCompany(updatedDb.treasuryAccounts),
+      paymentVouchers: stampTargetCompany(updatedDb.paymentVouchers),
+      treasuryTransfers: stampTargetCompany(updatedDb.treasuryTransfers),
+      bankReconciliations: stampTargetCompany(updatedDb.bankReconciliations),
+      posShifts: stampTargetCompany(updatedDb.posShifts),
+      heldPosCarts: stampTargetCompany(updatedDb.heldPosCarts),
+      expenseCategories: stampTargetCompany(updatedDb.expenseCategories),
+      expenseRecords: stampTargetCompany(updatedDb.expenseRecords),
+      employees: stampTargetCompany(updatedDb.employees),
+      payrollRuns: stampTargetCompany(updatedDb.payrollRuns),
+      fixedAssets: stampTargetCompany(updatedDb.fixedAssets),
+      customBooks: stampTargetCompany(updatedDb.customBooks),
+      customBookEntries: stampTargetCompany(updatedDb.customBookEntries),
+      approvalRules: stampTargetCompany(updatedDb.approvalRules),
+      approvalRequests: stampTargetCompany(updatedDb.approvalRequests),
+      fxRevaluations: stampTargetCompany(updatedDb.fxRevaluations),
+      savedReportDesigns: stampTargetCompany(updatedDb.savedReportDesigns),
+      auditLogs: stampTargetCompany(updatedDb.auditLogs),
+      taskAlerts: stampTargetCompany(updatedDb.taskAlerts),
+      dispatchLogs: stampTargetCompany(updatedDb.dispatchLogs),
+    };
 
     updatedDb = reconcileSaudiCurrenciesInDb(updatedDb);
     return { updatedDb, stats };

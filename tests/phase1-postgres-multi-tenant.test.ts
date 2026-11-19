@@ -96,9 +96,12 @@ describe('Phase 1 Cloud Multi-Tenant PostgreSQL, RLS, Tenant Admin & Company Per
       const rerun = await runMigrations(db!);
       expect(rerun).toEqual([]);
 
-      // Reversible rollback removes tables and cleans schema_migrations
-      const rolledBack = await rollbackLastMigration(db!);
-      expect(rolledBack).toBe('001_multi_tenant_core');
+      // Reversible rollback removes migration 002 columns first, then migration 001 tables
+      const rolledBack2 = await rollbackLastMigration(db!);
+      expect(rolledBack2).toBe('002_auth_session_version_and_contact');
+
+      const rolledBack1 = await rollbackLastMigration(db!);
+      expect(rolledBack1).toBe('001_multi_tenant_core');
 
       const afterRollbackTables = await db!.query<{ tablename: string }>(
         "SELECT tablename FROM pg_tables WHERE schemaname = 'public'"
@@ -107,7 +110,7 @@ describe('Phase 1 Cloud Multi-Tenant PostgreSQL, RLS, Tenant Admin & Company Per
 
       // Re-apply cleanly
       const reapplied = await runMigrations(db!);
-      expect(reapplied).toEqual(['001_multi_tenant_core']);
+      expect(reapplied).toEqual(['001_multi_tenant_core', '002_auth_session_version_and_contact']);
     });
 
     it('enforces real PostgreSQL Row-Level Security across company_state & company_audit_logs', async () => {

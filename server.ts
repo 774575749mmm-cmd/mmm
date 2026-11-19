@@ -11,11 +11,37 @@ import express, { type Request, type Response } from 'express';
 import { createErpServerApp, ensureInitialOwnerFromEnv } from './server/app.ts';
 import { createServerDatabaseFromEnv } from './server/db.ts';
 
-const PORT = Number(process.env.PORT || 3000);
+function parseCliFlag(flag: string): string | undefined {
+  const idx = process.argv.indexOf(flag);
+  if (idx !== -1 && idx + 1 < process.argv.length) {
+    return process.argv[idx + 1];
+  }
+  const prefix = `${flag}=`;
+  const inline = process.argv.find((arg) => arg.startsWith(prefix));
+  return inline ? inline.slice(prefix.length) : undefined;
+}
+
+const PORT = Number(parseCliFlag('--port') || process.env.PORT || 3000);
+const HOST = parseCliFlag('--host') || process.env.HOST || '0.0.0.0';
 const isProduction = process.env.NODE_ENV === 'production';
 
 async function startServer(): Promise<void> {
-  const db = await createServerDatabaseFromEnv();
+  const dbPromise = createServerDatabaseFromEnv();
+  const vitePromise = !isProduction
+    ? import('vite').then(({ createServer: createViteServer }) =>
+        createViteServer({
+          server: {
+            middlewareMode: true,
+            hmr: false,
+            ws: false,
+          },
+          appType: 'spa',
+        })
+      )
+    : Promise.resolve(null);
+
+  const [db, vite] = await Promise.all([dbPromise, vitePromise]);
+
   const bootStatus = await ensureInitialOwnerFromEnv(db);
   if (bootStatus.bootstrapped) {
     console.log(`[ERP Auth] Initial owner account bootstrapped from environment (${bootStatus.username}).`);
@@ -26,15 +52,7 @@ async function startServer(): Promise<void> {
   }
   const app = createErpServerApp({ isProduction, db });
 
-  if (!isProduction) {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: {
-        middlewareMode: true,
-        hmr: false,
-      },
-      appType: 'spa',
-    });
+  if (vite) {
     app.use(vite.middlewares);
   } else {
     const distDir = path.resolve('dist');
@@ -53,9 +71,25 @@ async function startServer(): Promise<void> {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
-    console.log(`ALMANSOOR SMART FINANCE ERP Server listening on http://0.0.0.0:${PORT}`);
+  const httpServer = app.listen(PORT, HOST, () => {
+    console.log(`ALMANSOOR SMART FINANCE ERP Server listening on http://${HOST}:${PORT}`);
   });
+
+  let shuttingDown = false;
+  const shutdown = async (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[ERP Server] Received ${signal}, shutting down gracefully...`);
+    await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    if (vite) {
+      await vite.close().catch(() => undefined);
+    }
+    await db.close().catch(() => undefined);
+    process.exit(0);
+  };
+
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  process.on('SIGINT', () => void shutdown('SIGINT'));
 }
 
 startServer().catch((err) => {
